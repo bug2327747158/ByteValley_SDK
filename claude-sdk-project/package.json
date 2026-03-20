@@ -1,0 +1,31 @@
+{
+  "name": "claude-sdk-project",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "basic": "tsx src/basic-agent.ts",
+    "tools": "tsx src/agent-with-tools.ts",
+    "hooks": "tsx src/agent-with-hooks.ts",
+    "zhipu": "tsx src/zhipu-agent.ts",
+    "zhipu-tools": "tsx src/zhipu-tools.ts",
+    "examples": "tsx src/examples-unified.ts",
+    "multi-agent": "tsx src/multi-agent.ts",
+    "test-multi": "tsx src/test-multi-agent.ts",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.77",
+    "@anthropic-ai/sdk": "^0.79.0",
+    "dotenv": "^17.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  }
+}
