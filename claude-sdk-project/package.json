@@ -12,6 +12,7 @@
     "examples": "tsx src/examples-unified.ts",
     "multi-agent": "tsx src/multi-agent.ts",
     "test-multi": "tsx src/test-multi-agent.ts",
+    "test-optimizations": "tsx src/test-optimizations.ts",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],

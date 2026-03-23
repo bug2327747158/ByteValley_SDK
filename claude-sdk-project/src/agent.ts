@@ -5,7 +5,7 @@
  */
 
 import Anthropic from "@anthropic-ai/sdk";
-import { readFile, writeFile, readdir } from "fs/promises";
+import { readFile, writeFile, readdir, stat } from "fs/promises";
 import { execSync } from "child_process";
 import { join } from "path";
 import { env } from "./config";
@@ -146,11 +146,49 @@ export async function executeTool(
       }
 
       case "search_files": {
-        const result = execSync(
-          `grep -r "${input.pattern}" ${input.path || "."} 2>/dev/null || true`,
-          { cwd, encoding: "utf-8" }
-        );
-        return { success: true, content: result.trim() || "未找到匹配结果" };
+        // 跨平台文件搜索（不依赖 grep）
+        const targetPath = join(cwd, input.path || ".");
+        const matches: string[] = [];
+        let searchCount = 0;
+        const MAX_FILES = 1000; // 防止搜索过大目录
+
+        async function searchDir(dirPath: string, depth = 0): Promise<void> {
+          if (depth > 10 || searchCount > MAX_FILES) return; // 防止过度递归
+
+          try {
+            const entries = await readdir(dirPath, { withFileTypes: true });
+
+            for (const entry of entries) {
+              searchCount++;
+              const fullPath = join(dirPath, entry.name);
+
+              if (entry.isDirectory()) {
+                // 跳过 node_modules 和 .git 目录
+                if (entry.name !== "node_modules" && entry.name !== ".git") {
+                  await searchDir(fullPath, depth + 1);
+                }
+              } else if (entry.isFile()) {
+                try {
+                  const content = await readFile(fullPath, "utf-8");
+                  if (content.includes(input.pattern)) {
+                    const relativePath = fullPath.replace(cwd + "/", "").replace(cwd + "\\", "");
+                    matches.push(relativePath);
+                  }
+                } catch {
+                  // 忽略无法读取的文件
+                }
+              }
+            }
+          } catch {
+            // 忽略无法访问的目录
+          }
+        }
+
+        await searchDir(targetPath);
+        return {
+          success: true,
+          content: matches.length > 0 ? matches.join("\n") : "未找到匹配结果",
+        };
       }
 
       default:
@@ -170,6 +208,8 @@ export interface AgentOptions {
   onMessage?: (content: string) => void;
   onToolUse?: (toolName: string, input: any) => void;
   onToolResult?: (toolName: string, result: ToolResult) => void;
+  onToolStart?: (toolName: string, input: any) => void;
+  onLoopStep?: (step: number, toolCount: number) => void;
 }
 
 export interface AgentConfig {
@@ -185,6 +225,8 @@ export class ClaudeAgent {
   private config: AgentConfig;
   private tools: Tool[];
   private messages: Anthropic.MessageParam[] = [];
+  private static readonly MAX_STEPS = 10;
+  private static readonly MAX_MESSAGES = 20;
 
   constructor(config: AgentConfig) {
     this.config = config;
@@ -222,6 +264,19 @@ export class ClaudeAgent {
   }
 
   /**
+   * 裁剪消息历史，防止 token 爆炸
+   * 保留第一条（系统提示）和最近的 MAX_MESSAGES 条消息
+   */
+  private trimMessages(maxMessages: number = ClaudeAgent.MAX_MESSAGES): void {
+    if (this.messages.length > maxMessages) {
+      this.messages = [
+        this.messages[0], // 保留第一条（通常是系统消息）
+        ...this.messages.slice(-maxMessages),
+      ];
+    }
+  }
+
+  /**
    * 清空对话历史
    */
   clearHistory(): void {
@@ -248,15 +303,20 @@ export class ClaudeAgent {
       onToolUse = (name, input) => console.log(`🔧 ${name}`, input),
       onToolResult = (name, result) =>
         console.log(`   ${result.success ? "✅" : "❌"}`, result.content || result.error),
+      onToolStart,
+      onLoopStep,
     } = options;
 
     // 添加用户消息
     this.addUserMessage(prompt);
 
     // 对话循环
+    let step = 0;
     let finalResponse = "";
 
-    while (true) {
+    while (step < ClaudeAgent.MAX_STEPS) {
+      step++;
+
       const response = await this.client.messages.create({
         model: this.config.model,
         max_tokens: maxTokens,
@@ -268,47 +328,76 @@ export class ClaudeAgent {
         messages: this.messages,
       });
 
-      // 处理响应
-      let hasToolUse = false;
-
+      // 收集所有 text 和 tool_use block
+      const toolUses: Anthropic.ToolUseBlock[] = [];
       for (const block of response.content) {
         if (block.type === "text") {
           finalResponse = block.text;
           onMessage(`\n🤖 Claude:\n${block.text}\n`);
         } else if (block.type === "tool_use") {
-          hasToolUse = true;
-          onToolUse(block.name, block.input);
-
-          // 执行工具
-          let result: ToolResult;
-          if (this.customToolExecutors.has(block.name)) {
-            result = await this.customToolExecutors.get(block.name)!(block.input);
-          } else {
-            result = await executeTool(block.name, block.input);
-          }
-
-          onToolResult(block.name, result);
-
-          // 添加到消息历史
-          this.messages.push({ role: "assistant", content: [block] });
-          this.messages.push({
-            role: "user",
-            content: [
-              {
-                type: "tool_result",
-                tool_use_id: block.id,
-                content: result.error || result.content || "",
-              },
-            ],
-          });
+          toolUses.push(block);
         }
       }
 
-      // 如果没有工具调用，返回结果
-      if (!hasToolUse) {
+      // 没有工具调用，返回结果
+      if (toolUses.length === 0) {
         return finalResponse;
       }
+
+      // 触发循环步骤回调
+      onLoopStep?.(step, toolUses.length);
+
+      // 并行执行所有工具
+      const results = await Promise.all(
+        toolUses.map(async (block) => {
+          onToolStart?.(block.name, block.input);
+          onToolUse(block.name, block.input);
+
+          try {
+            const executor = this.customToolExecutors.get(block.name);
+            const rawResult = executor
+              ? await executor(block.input)
+              : await executeTool(block.name, block.input);
+
+            const structuredResult = JSON.stringify({
+              ok: rawResult.success,
+              output: rawResult.content,
+              error: rawResult.error,
+            });
+
+            onToolResult(block.name, rawResult);
+
+            return { id: block.id, result: structuredResult };
+          } catch (err: any) {
+            const errorResult = JSON.stringify({
+              ok: false,
+              error: err.message,
+            });
+            return { id: block.id, result: errorResult };
+          }
+        })
+      );
+
+      // 添加消息历史
+      for (let i = 0; i < toolUses.length; i++) {
+        this.messages.push({ role: "assistant", content: [toolUses[i]] });
+        this.messages.push({
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: results[i].id,
+              content: results[i].result,
+            },
+          ],
+        });
+      }
+
+      // 裁剪消息历史
+      this.trimMessages();
     }
+
+    throw new Error("Agent loop exceeded max steps");
   }
 
   /**
@@ -318,12 +407,24 @@ export class ClaudeAgent {
     prompt: string,
     options: AgentOptions = {}
   ): AsyncGenerator<{ type: string; data: any }> {
+    const {
+      maxTokens = 8192,
+      onToolStart,
+      onToolUse,
+      onToolResult,
+      onLoopStep,
+    } = options;
+
     this.addUserMessage(prompt);
 
-    while (true) {
+    let step = 0;
+
+    while (step < ClaudeAgent.MAX_STEPS) {
+      step++;
+
       const response = await this.client.messages.create({
         model: this.config.model,
-        max_tokens: options.maxTokens || 8192,
+        max_tokens: maxTokens,
         tools: this.tools.map((t) => ({
           name: t.name,
           description: t.description,
@@ -332,40 +433,101 @@ export class ClaudeAgent {
         messages: this.messages,
       });
 
-      let hasToolUse = false;
-
+      // 收集所有 text 和 tool_use block
+      const toolUses: Anthropic.ToolUseBlock[] = [];
       for (const block of response.content) {
         if (block.type === "text") {
           yield { type: "text", data: block.text };
         } else if (block.type === "tool_use") {
-          hasToolUse = true;
-          yield { type: "tool_use", data: { name: block.name, input: block.input } };
-
-          const result = this.customToolExecutors.has(block.name)
-            ? await this.customToolExecutors.get(block.name)!(block.input)
-            : await executeTool(block.name, block.input);
-
-          yield { type: "tool_result", data: { name: block.name, result } };
-
-          this.messages.push({ role: "assistant", content: [block] });
-          this.messages.push({
-            role: "user",
-            content: [
-              {
-                type: "tool_result",
-                tool_use_id: block.id,
-                content: result.error || result.content || "",
-              },
-            ],
-          });
+          toolUses.push(block);
         }
       }
 
-      if (!hasToolUse) {
+      // 没有工具调用，完成
+      if (toolUses.length === 0) {
         yield { type: "done", data: null };
         return;
       }
+
+      // 触发循环步骤回调
+      onLoopStep?.(step, toolUses.length);
+
+      // 先 yield 所有 tool_use 事件
+      for (const block of toolUses) {
+        onToolStart?.(block.name, block.input);
+        onToolUse?.(block.name, block.input);
+        yield {
+          type: "tool_use",
+          data: { name: block.name, input: block.input },
+        };
+      }
+
+      // 并行执行所有工具，收集结果
+      const results = await Promise.all(
+        toolUses.map(async (block) => {
+          try {
+            const executor = this.customToolExecutors.get(block.name);
+            const rawResult = executor
+              ? await executor(block.input)
+              : await executeTool(block.name, block.input);
+
+            const structuredResult = JSON.stringify({
+              ok: rawResult.success,
+              output: rawResult.content,
+              error: rawResult.error,
+            });
+
+            onToolResult?.(block.name, rawResult);
+
+            return {
+              id: block.id,
+              result: structuredResult,
+              name: block.name,
+              rawResult,
+            };
+          } catch (err: any) {
+            const errorResult = JSON.stringify({
+              ok: false,
+              error: err.message,
+            });
+            return {
+              id: block.id,
+              result: errorResult,
+              name: block.name,
+              rawResult: { success: false, error: err.message },
+            };
+          }
+        })
+      );
+
+      // yield 所有 tool_result 事件
+      for (const r of results) {
+        yield {
+          type: "tool_result",
+          data: { name: r.name, result: r.rawResult },
+        };
+      }
+
+      // 添加消息历史
+      for (let i = 0; i < toolUses.length; i++) {
+        this.messages.push({ role: "assistant", content: [toolUses[i]] });
+        this.messages.push({
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: results[i].id,
+              content: results[i].result,
+            },
+          ],
+        });
+      }
+
+      // 裁剪消息历史
+      this.trimMessages();
     }
+
+    throw new Error("Agent loop exceeded max steps");
   }
 }
 

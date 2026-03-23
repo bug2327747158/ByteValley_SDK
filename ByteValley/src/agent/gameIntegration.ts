@@ -401,6 +401,116 @@ export async function executeSDKTask(
 }
 
 /**
+ * 流式执行 SDK 任务（支持实时进度反馈）
+ *
+ * @param agentId 机器人 ID
+ * @param title 任务标题
+ * @param description 任务描述
+ * @param workingDirectory 工作目录（可选）
+ * @param sdkPrompt 发送给 SDK 的提示词（可选）
+ * @param onChunk 实时数据回调
+ * @returns 执行结果
+ */
+export async function executeSDKTaskStream(
+  agentId: string,
+  title: string,
+  description: string,
+  workingDirectory: string | undefined,
+  onChunk: (chunk: {
+    type: 'text' | 'tool_use' | 'tool_result' | 'done' | 'error' | 'state_change';
+    data: any;
+  }) => void,
+  sdkPrompt?: string
+): Promise<string> {
+  const bridge = getAgentBridge();
+
+  // 如果没有提供工作目录，使用默认值
+  const finalWorkingDir = workingDirectory || (() => {
+    if (typeof window !== 'undefined') {
+      return localStorage.getItem('bytevalley-working-dir') || 'D:\\work_data\\claude_workspace\\ByteValley';
+    }
+    return '/mnt/d/work_data/claude_workspace/ByteValley';
+  })();
+
+  const mapping = mappings.get(agentId);
+  if (!mapping?.sdkAgent) {
+    const error = `SDK agent not found: ${agentId}`;
+    onChunk({ type: 'error', data: { message: error } });
+    throw new Error(error);
+  }
+
+  console.log('[gameIntegration] executeSDKTaskStream:', { agentId, workingDirectory: finalWorkingDir });
+
+  // 发送初始状态
+  onChunk({ type: 'state_change', data: { state: 'THINKING', message: 'Starting task...' } });
+
+  let finalResponse = '';
+
+  try {
+    // 使用 SDK 的 run 方法，通过回调实现流式效果
+    const result = await mapping.sdkAgent.run(description, {
+      workingDirectory: finalWorkingDir,
+      maxTokens: 8192,
+      // 文本流式回调
+      onMessage: (content: string) => {
+        finalResponse = content;
+        onChunk({ type: 'text', data: { content } });
+      },
+      // 工具调用回调
+      onToolUse: (name: string, input: any) => {
+        // 只发送一次，直接设为执行中状态（简化版）
+        onChunk({
+          type: 'tool_use',
+          data: {
+            toolName: name,
+            input,
+            targetState: TOOL_TO_STATE[name] || 'THINKING',
+            status: 'executing'
+          }
+        });
+        onChunk({ type: 'state_change', data: { state: TOOL_TO_STATE[name] || 'THINKING', message: `Using tool: ${name}...` } });
+      },
+      // 工具结果回调
+      onToolResult: (name: string, result: any) => {
+        onChunk({
+          type: 'tool_result',
+          data: {
+            toolName: name,
+            result,
+            success: result.success
+          }
+        });
+        // 工具执行后回到思考状态
+        onChunk({ type: 'state_change', data: { state: 'THINKING', message: `Completed tool: ${name}` } });
+      },
+    });
+
+    // 任务完成
+    onChunk({ type: 'done', data: { result } });
+    onChunk({ type: 'state_change', data: { state: 'IDLE', message: 'Task completed' } });
+
+    return result;
+  } catch (error: any) {
+    onChunk({ type: 'error', data: { message: error.message } });
+    onChunk({ type: 'state_change', data: { state: 'ERROR', message: `Error: ${error.message}` } });
+    throw error;
+  }
+}
+
+// 工具到状态的映射
+const TOOL_TO_STATE: Record<string, import('./types').AgentGameState> = {
+  'read_file': 'READING',
+  'search_files': 'READING',
+  'list_files': 'READING',
+  'glob_files': 'READING',
+  'write_file': 'WRITING',
+  'edit_file': 'WRITING',
+  'run_command': 'EXECUTING',
+  'ask_user_question': 'AWAITING_APPROVAL',
+  'create_plan': 'PLANNING',
+};
+
+/**
  * 快速查询（不触发工具）
  *
  * @param agentId 机器人 ID

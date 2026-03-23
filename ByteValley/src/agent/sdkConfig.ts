@@ -3,6 +3,21 @@
  * 主要为 Electron 桌面应用设计，浏览器环境仅用于演示
  */
 
+// ==================== 常量配置 ====================
+
+const MAX_STEPS = 10;
+const MAX_MESSAGES = 20;
+
+/**
+ * 裁剪消息历史，避免 token 爆炸
+ */
+function trimMessages(messages: any[], maxMessages: number = MAX_MESSAGES): void {
+  if (messages.length > maxMessages) {
+    // 保留最近的 maxMessages 条消息
+    messages.splice(0, messages.length - maxMessages);
+  }
+}
+
 // ==================== SDK 配置 ====================
 
 export const sdkConfig = {
@@ -161,6 +176,8 @@ export async function createSDKAgent() {
       onToolUse?: (name: string, input: any) => void;
       onToolResult?: (name: string, result: any) => void;
       workingDirectory?: string;  // 任务特定的工作目录
+      onToolStart?: (name: string, input: any) => void;
+      onLoopStep?: (step: number, toolCount: number) => void;
     }): Promise<string> {
       const { DEFAULT_TOOLS, executeTool, getEnvironment } = await import('./tools');
       const toolEnv = getEnvironment();
@@ -172,9 +189,13 @@ export async function createSDKAgent() {
 
       const messages: any[] = [{ role: 'user', content: prompt }];
       let finalResponse = '';
+      let step = 0;
 
-      while (true) {
+      while (step < MAX_STEPS) {
+        step++;
+        console.log('[SDK Agent] Step', step, '/', MAX_STEPS);
         console.log('[SDK Agent] Sending API request...');
+
         const response = await client.messages.create({
           model: sdkConfig.model,
           max_tokens: options?.maxTokens || 8192,
@@ -187,16 +208,33 @@ export async function createSDKAgent() {
         });
 
         console.log('[SDK Agent] Got response, content blocks:', response.content.length);
-        let hasToolUse = false;
 
+        // 收集所有 tool_use blocks
+        const toolUses: any[] = [];
         for (const block of response.content) {
           if (block.type === 'text') {
             finalResponse = block.text;
             console.log('[SDK Agent] Text response length:', block.text.length);
             options?.onMessage?.(block.text);
           } else if (block.type === 'tool_use') {
-            hasToolUse = true;
+            toolUses.push(block);
+          }
+        }
+
+        // 没有工具调用，返回结果
+        if (toolUses.length === 0) {
+          console.log('[SDK Agent] No tool use, returning final response');
+          return finalResponse;
+        }
+
+        console.log('[SDK Agent] Executing', toolUses.length, 'tools in parallel');
+        options?.onLoopStep?.(step, toolUses.length);
+
+        // 并行执行所有工具
+        const results = await Promise.all(
+          toolUses.map(async (block) => {
             console.log('[SDK Agent] Tool use requested:', block.name, block.input);
+            options?.onToolStart?.(block.name, block.input);
             options?.onToolUse?.(block.name, block.input);
 
             // 执行工具（使用确定的工作目录）
@@ -204,23 +242,30 @@ export async function createSDKAgent() {
             console.log('[SDK Agent] Tool result:', result.success ? 'Success' : 'Failed', result);
             options?.onToolResult?.(block.name, result);
 
-            messages.push({ role: 'assistant', content: [block] });
-            messages.push({
-              role: 'user',
-              content: [{
-                type: 'tool_result',
-                tool_use_id: block.id,
-                content: result.error || result.content || '',
-              }],
-            });
-          }
+            return { id: block.id, result };
+          })
+        );
+
+        // 批量添加消息历史
+        for (let i = 0; i < toolUses.length; i++) {
+          messages.push({ role: 'assistant', content: [toolUses[i]] });
+          messages.push({
+            role: 'user',
+            content: [{
+              type: 'tool_result',
+              tool_use_id: results[i].id,
+              content: results[i].result.error || results[i].result.content || '',
+            }],
+          });
         }
 
-        if (!hasToolUse) {
-          console.log('[SDK Agent] No tool use, returning final response');
-          return finalResponse;
-        }
+        // 裁剪消息历史
+        trimMessages(messages);
+        console.log('[SDK Agent] Messages after trim:', messages.length);
       }
+
+      console.error('[SDK Agent] Exceeded max steps:', MAX_STEPS);
+      throw new Error(`Agent loop exceeded max steps (${MAX_STEPS})`);
     },
   };
 

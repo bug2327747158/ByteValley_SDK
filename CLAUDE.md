@@ -36,6 +36,8 @@ npm run preview        # Preview production build
 npm run lint           # TypeScript type checking (noEmit)
 ```
 
+**IMPORTANT**: This workspace is in WSL but the app runs on Windows. When testing `npm run dev`, ask the user to manually run and verify the dev server in their Windows terminal instead of running it from WSL. The dev server needs to be started in Windows to properly serve the React application.
+
 ## Architecture
 
 ### claude-sdk-project

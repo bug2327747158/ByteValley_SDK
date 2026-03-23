@@ -28,12 +28,32 @@ type AgentState = 'IDLE' | 'THINKING' | 'READING' | 'WRITING' | 'EXECUTING' | 'S
 type ViewState = 'MAIN' | 'BULLETIN' | 'ROUNDTABLE_CHAT' | 'CLI_CHAT';
 type TaskStatus = 'TODO' | 'IN_PROGRESS' | 'COMPLETED' | 'FAILED';
 
+// 工具执行状态
+type ToolExecutionStatus = 'preparing' | 'executing' | 'done' | 'failed';
+
+// 工具中文名称映射
+const TOOL_DISPLAY_NAMES: Record<string, string> = {
+  'read_file': '读取文件',
+  'write_file': '写入文件',
+  'edit_file': '编辑文件',
+  'list_files': '列出文件',
+  'run_command': '执行命令',
+  'search_files': '搜索文件',
+  'glob_files': '匹配文件',
+};
+
 // 聊天消息类型
 interface ChatMessage {
   id: string;
-  role: 'user' | 'assistant';
+  role: 'user' | 'assistant' | 'system';  // 添加 'system' 类型用于工具调用/状态
   content: string;
   timestamp: number;
+  isStreaming?: boolean;      // 标识是否为流式消息
+  isComplete?: boolean;       // 流式消息是否完成
+  messageType?: 'text' | 'tool_use' | 'tool_result' | 'status';
+  toolName?: string;
+  toolInput?: any;            // 工具输入参数
+  toolStatus?: ToolExecutionStatus;  // 工具执行状态
 }
 
 // 独立的聊天会话（标签页）
@@ -395,6 +415,7 @@ const CliChatMode = ({
   allSessions: ChatSession[];
 }) => {
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const [collapsedMessages, setCollapsedMessages] = React.useState<Set<string>>(new Set());
 
   // Extract values from active session
   const messages = activeSession?.messages ?? [];
@@ -412,6 +433,71 @@ const CliChatMode = ({
     const message = input;
     onInputChange('');
     await onSendMessage(message);
+  };
+
+  // 切换系统消息的展开/折叠状态
+  const toggleMessageCollapse = (msgId: string) => {
+    setCollapsedMessages(prev => {
+      const newSet = new Set(prev);
+      if (newSet.has(msgId)) {
+        newSet.delete(msgId);
+      } else {
+        newSet.add(msgId);
+      }
+      return newSet;
+    });
+  };
+
+  // 获取系统消息的样式
+  const getSystemMessageStyle = (messageType?: 'text' | 'tool_use' | 'tool_result' | 'status') => {
+    switch (messageType) {
+      case 'tool_use':
+        return {
+          bg: 'bg-yellow-900/20',
+          border: 'border-yellow-700',
+          text: 'text-yellow-300',
+          icon: '🔧'
+        };
+      case 'tool_result':
+        return {
+          bg: 'bg-green-900/20',
+          border: 'border-green-700',
+          text: 'text-green-300',
+          icon: '✅'
+        };
+      case 'status':
+        return {
+          bg: 'bg-zinc-800/50',
+          border: 'border-zinc-600',
+          text: 'text-zinc-400',
+          icon: 'ℹ️'
+        };
+      default:
+        return {
+          bg: 'bg-zinc-800/50',
+          border: 'border-zinc-600',
+          text: 'text-zinc-400',
+          icon: 'ℹ️'
+        };
+    }
+  };
+
+  // 获取工具显示名称
+  const getToolDisplayName = (toolName?: string) => {
+    return toolName ? TOOL_DISPLAY_NAMES[toolName] || toolName : '';
+  };
+
+  // 获取状态显示文本
+  const getStatusBadge = (status?: ToolExecutionStatus, messageType?: 'text' | 'tool_use' | 'tool_result' | 'status') => {
+    if (status === 'preparing') return '[准备中]';
+    if (status === 'executing') return '[执行中]';
+    if (status === 'done') return '[完成]';
+    if (status === 'failed') return '[失败]';
+    // 对于工具结果消息，根据成功/失败显示状态
+    if (messageType === 'tool_result') {
+      return '[完成]';
+    }
+    return '';
   };
 
   return (
@@ -458,29 +544,84 @@ const CliChatMode = ({
             </div>
           ) : null}
 
-          {messages.map((msg) => (
-            <div key={msg.id} className={`flex gap-3 ${msg.role === 'user' ? 'flex-row-reverse' : ''}`}>
-              <div className={`w-8 h-8 border-2 rounded flex items-center justify-center shrink-0 ${
-                msg.role === 'user'
-                  ? 'bg-blue-900 border-blue-500'
-                  : 'bg-emerald-900 border-emerald-500'
-              }`}>
-                <span className="text-xs">{msg.role === 'user' ? '👤' : '🤖'}</span>
-              </div>
-              <div className={`max-w-[70%] p-3 ${
-                msg.role === 'user'
-                  ? 'bg-blue-900/30 border-2 border-blue-700 rounded-l-lg rounded-br-lg text-blue-300'
-                  : 'bg-zinc-800 border-2 border-zinc-700 rounded-r-lg rounded-bl-lg text-emerald-400'
-              }`}>
-                <div className="whitespace-pre-wrap break-words">{msg.content}</div>
-                <div className="text-[8px] text-zinc-600 mt-2">
-                  {new Date(msg.timestamp).toLocaleTimeString()}
+          {messages.map((msg) => {
+            // 系统消息（工具调用/结果/状态）
+            if (msg.role === 'system') {
+              const style = getSystemMessageStyle(msg.messageType);
+              const isCollapsed = collapsedMessages.has(msg.id);
+              const statusBadge = getStatusBadge(msg.toolStatus, msg.messageType);
+
+              return (
+                <div key={msg.id} className="flex gap-3">
+                  <div className={`w-8 h-8 border-2 rounded flex items-center justify-center shrink-0 ${style.bg} ${style.border}`}>
+                    <span className="text-xs">{style.icon}</span>
+                  </div>
+                  <div
+                    className={`max-w-[70%] border-2 ${style.border} ${style.bg} rounded-lg ${style.text} cursor-pointer`}
+                    onClick={() => toggleMessageCollapse(msg.id)}
+                  >
+                    <div className="p-2 text-[10px] flex items-center justify-between gap-2">
+                      <span className="flex-1">{msg.content}</span>
+                      <div className="flex items-center gap-1 shrink-0">
+                        {statusBadge && <span className="text-[8px] opacity-70">{statusBadge}</span>}
+                        <span className="text-[8px] opacity-50">{isCollapsed ? '▶' : '▼'}</span>
+                      </div>
+                    </div>
+                    {!isCollapsed && (
+                      <div className="px-3 pb-2 text-[9px] opacity-75 border-t border-zinc-700 pt-2 space-y-1">
+                        {msg.toolName && (
+                          <div>工具: {getToolDisplayName(msg.toolName)} ({msg.toolName})</div>
+                        )}
+                        {msg.toolInput && (
+                          <div>参数: {JSON.stringify(msg.toolInput, null, 2)}</div>
+                        )}
+                        <div>时间: {new Date(msg.timestamp).toLocaleTimeString()}</div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              );
+            }
+
+            // 用户消息
+            if (msg.role === 'user') {
+              return (
+                <div key={msg.id} className="flex gap-3 flex-row-reverse">
+                  <div className="w-8 h-8 border-2 rounded flex items-center justify-center shrink-0 bg-blue-900 border-blue-500">
+                    <span className="text-xs">👤</span>
+                  </div>
+                  <div className="max-w-[70%] p-3 bg-blue-900/30 border-2 border-blue-700 rounded-l-lg rounded-br-lg text-blue-300">
+                    <div className="whitespace-pre-wrap break-words">{msg.content}</div>
+                    <div className="text-[8px] text-zinc-600 mt-2">
+                      {new Date(msg.timestamp).toLocaleTimeString()}
+                    </div>
+                  </div>
+                </div>
+              );
+            }
+
+            // 助手消息（支持流式）
+            return (
+              <div key={msg.id} className="flex gap-3">
+                <div className="w-8 h-8 border-2 rounded flex items-center justify-center shrink-0 bg-emerald-900 border-emerald-500">
+                  <span className="text-xs">🤖</span>
+                </div>
+                <div className="max-w-[70%] p-3 bg-zinc-800 border-2 border-zinc-700 rounded-r-lg rounded-bl-lg text-emerald-400">
+                  <div className="whitespace-pre-wrap break-words">
+                    {msg.content}
+                    {msg.isStreaming && (
+                      <span className="inline-block w-2 h-4 bg-emerald-400 ml-1 animate-pulse"></span>
+                    )}
+                  </div>
+                  <div className="text-[8px] text-zinc-600 mt-2">
+                    {new Date(msg.timestamp).toLocaleTimeString()}
+                  </div>
                 </div>
               </div>
-            </div>
-          ))}
+            );
+          })}
 
-          {isProcessing && (
+          {isProcessing && messages.filter(m => m.role === 'assistant' && m.isStreaming).length === 0 && (
             <div className="flex gap-3">
               <div className="w-8 h-8 bg-emerald-900 border-2 border-emerald-500 rounded flex items-center justify-center shrink-0">
                 <span className="text-xs">🤖</span>
@@ -989,6 +1130,42 @@ const [showDirConfig, setShowDirConfig] = useState(false);
       return;
     }
 
+    // 确保 Agent 的 chat session 存在
+    setChatSessions(prev => {
+      const newMap: Map<string, ChatSession> = new Map(prev);
+      if (!newMap.has(task.agentId!)) {
+        newMap.set(task.agentId!, {
+          agentId: task.agentId!,
+          messages: [],
+          input: '',
+          isProcessing: false,
+          lastActive: Date.now(),
+        });
+      }
+      return newMap;
+    });
+
+    // 添加任务开始消息到 chat session
+    const taskStartMessage: ChatMessage = {
+      id: `msg_${Date.now()}_task_start`,
+      role: 'system',
+      content: `📋 Task assigned: ${task.title}`,
+      timestamp: Date.now(),
+      messageType: 'status',
+    };
+    setChatSessions(prev => {
+      const newMap: Map<string, ChatSession> = new Map(prev);
+      const session = newMap.get(task.agentId!) as ChatSession | undefined;
+      if (session) {
+        newMap.set(task.agentId!, {
+          ...session,
+          messages: [...session.messages, taskStartMessage],
+          lastActive: Date.now(),
+        });
+      }
+      return newMap;
+    });
+
     // 更新任务状态
     setTasks(tasks.map(t => {
       if (t.id === task.id) {
@@ -1010,9 +1187,194 @@ const [showDirConfig, setShowDirConfig] = useState(false);
       // 机器人状态变化
       triggerState('THINKING', `Starting: ${task.title}...`, task.agentId);
 
-      // 调用 SDK 执行，传递当前工作目录
-      const { executeSDKTask } = await import('./agent/gameIntegration');
-      const result = await executeSDKTask(task.agentId, task.title, prompt, workingDirectory);
+      // 调用 SDK 执行，传递当前工作目录（使用流式版本同步到 CLI 对话框）
+      const { executeSDKTaskStream } = await import('./agent/gameIntegration');
+
+      // 准备流式消息更新
+      const assistantMessageId = `msg_${Date.now()}_task_assistant`;
+      let assistantContent = '';
+
+      const updateStreamMessage = (content: string, isComplete = false) => {
+        setChatSessions(prev => {
+          const newMap: Map<string, ChatSession> = new Map(prev);
+          const session = newMap.get(task.agentId!) as ChatSession | undefined;
+          if (session) {
+            const existingMsgIndex = session.messages.findIndex(m => m.id === assistantMessageId);
+            const updatedMsg: ChatMessage = {
+              id: assistantMessageId,
+              role: 'assistant',
+              content,
+              timestamp: Date.now(),
+              isStreaming: !isComplete,
+              isComplete,
+            };
+            let newMessages: ChatMessage[];
+            if (existingMsgIndex >= 0) {
+              newMessages = [...session.messages];
+              newMessages[existingMsgIndex] = updatedMsg;
+            } else {
+              newMessages = [...session.messages, updatedMsg];
+            }
+            newMap.set(task.agentId!, {
+              ...session,
+              messages: newMessages,
+              isProcessing: !isComplete,
+              lastActive: Date.now(),
+            });
+          }
+          return newMap;
+        });
+      };
+
+      const addSystemMessage = (
+        content: string,
+        messageType: 'tool_use' | 'tool_result' | 'status',
+        toolName?: string,
+        toolInput?: any,
+        toolStatus?: ToolExecutionStatus,
+        updateExistingId?: string
+      ) => {
+        setChatSessions(prev => {
+          const newMap: Map<string, ChatSession> = new Map(prev);
+          const session = newMap.get(task.agentId!) as ChatSession | undefined;
+          if (session) {
+            // 如果指定了要更新的消息 ID，则更新现有消息
+            if (updateExistingId) {
+              const existingIndex = session.messages.findIndex(m => m.id === updateExistingId);
+              if (existingIndex >= 0) {
+                const updated = [...session.messages];
+                updated[existingIndex] = {
+                  ...updated[existingIndex],
+                  content,
+                  toolStatus,
+                  timestamp: Date.now(),
+                };
+                newMap.set(task.agentId!, {
+                  ...session,
+                  messages: updated,
+                  lastActive: Date.now(),
+                });
+                return newMap;
+              }
+            }
+
+            // 否则创建新消息
+            const systemMsg: ChatMessage = {
+              id: `msg_${Date.now()}_system_${Math.random().toString(36).substr(2, 5)}`,
+              role: 'system',
+              content,
+              timestamp: Date.now(),
+              messageType,
+              toolName,
+              toolInput,
+              toolStatus,
+            };
+            newMap.set(task.agentId!, {
+              ...session,
+              messages: [...session.messages, systemMsg],
+              lastActive: Date.now(),
+            });
+          }
+          return newMap;
+        });
+      };
+
+      // 追踪当前工具消息 ID，用于更新而非创建新消息
+      let currentToolMessageId: string | undefined;
+
+      const result = await executeSDKTaskStream(
+        task.agentId,
+        task.title,
+        prompt,
+        workingDirectory,
+        async (chunk) => {
+          switch (chunk.type) {
+            case 'text':
+              assistantContent = chunk.data.content;
+              updateStreamMessage(assistantContent);
+              break;
+            case 'tool_use':
+              // 第一次创建工具消息，后续更新同一消息
+              if (!currentToolMessageId) {
+                addSystemMessage(
+                  `🔧 正在${TOOL_DISPLAY_NAMES[chunk.data.toolName] || chunk.data.toolName}...`,
+                  'tool_use',
+                  chunk.data.toolName,
+                  chunk.data.input,
+                  chunk.data.status
+                );
+                // 获取刚创建的消息 ID
+                setChatSessions(prev => {
+                  const session = prev.get(task.agentId!);
+                  if (session && session.messages.length > 0) {
+                    const lastMsg = session.messages[session.messages.length - 1];
+                    if (lastMsg.role === 'system' && lastMsg.messageType === 'tool_use') {
+                      currentToolMessageId = lastMsg.id;
+                    }
+                  }
+                  return prev;
+                });
+              } else {
+                // 更新现有消息
+                addSystemMessage(
+                  `🔧 正在${TOOL_DISPLAY_NAMES[chunk.data.toolName] || chunk.data.toolName}...`,
+                  'tool_use',
+                  chunk.data.toolName,
+                  chunk.data.input,
+                  chunk.data.status,
+                  currentToolMessageId
+                );
+              }
+              triggerState(chunk.data.targetState as AgentState, `Using tool: ${chunk.data.toolName}`, task.agentId);
+              break;
+            case 'tool_result':
+              const success = chunk.data.success;
+              const displayName = TOOL_DISPLAY_NAMES[chunk.data.toolName] || chunk.data.toolName;
+              // 更新现有工具消息为完成状态
+              if (currentToolMessageId) {
+                addSystemMessage(
+                  success
+                    ? `✅ ${displayName}完成`
+                    : `❌ ${displayName}失败`,
+                  'tool_result',
+                  chunk.data.toolName,
+                  undefined,
+                  success ? 'done' : 'failed',
+                  currentToolMessageId
+                );
+              } else {
+                addSystemMessage(
+                  success
+                    ? `✅ ${displayName}完成`
+                    : `❌ ${displayName}失败`,
+                  'tool_result',
+                  chunk.data.toolName,
+                  undefined,
+                  success ? 'done' : 'failed'
+                );
+              }
+              currentToolMessageId = undefined;  // 重置
+              break;
+            case 'state_change':
+              if (chunk.data.state !== 'IDLE' && chunk.data.state !== 'SUCCESS') {
+                triggerState(chunk.data.state as AgentState, chunk.data.message, task.agentId);
+              }
+              break;
+            case 'done':
+              updateStreamMessage(assistantContent, true);
+              break;
+            case 'error':
+              addSystemMessage(`❌ Error: ${chunk.data.message}`, 'status');
+              break;
+          }
+        }
+      );
+
+      // 确保最终结果被设置
+      if (result && result !== assistantContent) {
+        assistantContent = result;
+        updateStreamMessage(result, true);
+      }
 
       // 任务完成
       setTasks(tasks.map(t => {
@@ -1035,6 +1397,35 @@ const [showDirConfig, setShowDirConfig] = useState(false);
       triggerState('SUCCESS', 'Mission completed!', task.agentId);
 
     } catch (error: any) {
+      // 添加错误消息到 chat session
+      setChatSessions(prev => {
+        const newMap: Map<string, ChatSession> = new Map(prev);
+        const session = newMap.get(task.agentId!) as ChatSession | undefined;
+        if (session) {
+          const errorMsg: ChatMessage = {
+            id: `msg_${Date.now()}_task_error`,
+            role: 'assistant',
+            content: `Error: ${error.message}`,
+            timestamp: Date.now(),
+            isComplete: true,
+          };
+          const systemMsg: ChatMessage = {
+            id: `msg_${Date.now()}_task_error_sys`,
+            role: 'system',
+            content: `❌ Task failed: ${error.message}`,
+            timestamp: Date.now(),
+            messageType: 'status',
+          };
+          newMap.set(task.agentId!, {
+            ...session,
+            messages: [...session.messages, errorMsg, systemMsg],
+            isProcessing: false,
+            lastActive: Date.now(),
+          });
+        }
+        return newMap;
+      });
+
       // 任务失败
       setTasks(tasks.map(t => {
         if (t.id === task.id) {
@@ -1157,63 +1548,207 @@ const [showDirConfig, setShowDirConfig] = useState(false);
       return newMap;
     });
 
-    try {
-      // 设置机器人状态为思考
-      triggerState('THINKING', 'Processing your message...', activeTabAgentId);
+    // 创建流式助手消息占位符
+    const assistantMessageId = `msg_${Date.now()}_assistant`;
+    let assistantContent = '';
 
-      // 使用 executeSDKTask 执行（这会使用 agent.run()，支持连续对话）
-      const { executeSDKTask } = await import('./agent/gameIntegration');
-      const result = await executeSDKTask(
-        activeTabAgentId,
-        'Chat Message',
-        message,
-        workingDirectory
-      );
-
-      // 添加 AI 回复
-      const assistantMessage: ChatMessage = {
-        id: `msg_${Date.now()}_assistant`,
-        role: 'assistant',
-        content: result,
-        timestamp: Date.now(),
-      };
-
+    const updateStreamMessage = (content: string, isComplete = false) => {
       setChatSessions(prev => {
         const newMap: Map<string, ChatSession> = new Map(prev);
         const session = newMap.get(activeTabAgentId) as ChatSession | undefined;
         if (session) {
+          // 查找并更新现有的助手消息，或者添加新的
+          const existingMsgIndex = session.messages.findIndex(m => m.id === assistantMessageId);
+          const updatedMsg: ChatMessage = {
+            id: assistantMessageId,
+            role: 'assistant',
+            content,
+            timestamp: Date.now(),
+            isStreaming: !isComplete,
+            isComplete,
+          };
+
+          let newMessages: ChatMessage[];
+          if (existingMsgIndex >= 0) {
+            newMessages = [...session.messages];
+            newMessages[existingMsgIndex] = updatedMsg;
+          } else {
+            newMessages = [...session.messages, updatedMsg];
+          }
+
           newMap.set(activeTabAgentId, {
             ...session,
-            messages: [...session.messages, assistantMessage],
-            isProcessing: false
+            messages: newMessages,
+            isProcessing: !isComplete
           });
         }
         return newMap;
       });
+    };
+
+    // 添加系统消息（工具调用/结果/状态）
+    const addSystemMessage = (
+      content: string,
+      messageType: 'tool_use' | 'tool_result' | 'status',
+      toolName?: string,
+      toolInput?: any,
+      toolStatus?: ToolExecutionStatus,
+      updateExistingId?: string
+    ) => {
+      setChatSessions(prev => {
+        const newMap: Map<string, ChatSession> = new Map(prev);
+        const session = newMap.get(activeTabAgentId) as ChatSession | undefined;
+        if (session) {
+          // 如果指定了要更新的消息 ID，则更新现有消息
+          if (updateExistingId) {
+            const existingIndex = session.messages.findIndex(m => m.id === updateExistingId);
+            if (existingIndex >= 0) {
+              const updated = [...session.messages];
+              updated[existingIndex] = {
+                ...updated[existingIndex],
+                content,
+                toolStatus,
+                timestamp: Date.now(),
+              };
+              newMap.set(activeTabAgentId, {
+                ...session,
+                messages: updated,
+              });
+              return newMap;
+            }
+          }
+
+          // 否则创建新消息
+          const systemMsg: ChatMessage = {
+            id: `msg_${Date.now()}_system_${Math.random().toString(36).substr(2, 5)}`,
+            role: 'system',
+            content,
+            timestamp: Date.now(),
+            messageType,
+            toolName,
+            toolInput,
+            toolStatus,
+          };
+          newMap.set(activeTabAgentId, {
+            ...session,
+            messages: [...session.messages, systemMsg],
+          });
+        }
+        return newMap;
+      });
+    };
+
+    try {
+      // 使用流式执行
+      const { executeSDKTaskStream } = await import('./agent/gameIntegration');
+
+      // 追踪当前工具消息 ID，用于更新而非创建新消息
+      let currentToolMessageId: string | undefined;
+
+      const result = await executeSDKTaskStream(
+        activeTabAgentId,
+        'Chat Message',
+        message,
+        workingDirectory,
+        async (chunk) => {
+          switch (chunk.type) {
+            case 'text':
+              // 实时更新文本内容
+              assistantContent = chunk.data.content;
+              updateStreamMessage(assistantContent);
+              break;
+            case 'tool_use':
+              // 第一次创建工具消息，后续更新同一消息
+              if (!currentToolMessageId) {
+                addSystemMessage(
+                  `🔧 正在${TOOL_DISPLAY_NAMES[chunk.data.toolName] || chunk.data.toolName}...`,
+                  'tool_use',
+                  chunk.data.toolName,
+                  chunk.data.input,
+                  chunk.data.status
+                );
+                // 获取刚创建的消息 ID
+                setChatSessions(prev => {
+                  const session = prev.get(activeTabAgentId);
+                  if (session && session.messages.length > 0) {
+                    const lastMsg = session.messages[session.messages.length - 1];
+                    if (lastMsg.role === 'system' && lastMsg.messageType === 'tool_use') {
+                      currentToolMessageId = lastMsg.id;
+                    }
+                  }
+                  return prev;
+                });
+              } else {
+                // 更新现有消息
+                addSystemMessage(
+                  `🔧 正在${TOOL_DISPLAY_NAMES[chunk.data.toolName] || chunk.data.toolName}...`,
+                  'tool_use',
+                  chunk.data.toolName,
+                  chunk.data.input,
+                  chunk.data.status,
+                  currentToolMessageId
+                );
+              }
+              // 更新机器人状态
+              triggerState(chunk.data.targetState as AgentState, `Using tool: ${chunk.data.toolName}`, activeTabAgentId);
+              break;
+            case 'tool_result':
+              // 更新现有工具消息为完成状态
+              const success = chunk.data.success;
+              const displayName = TOOL_DISPLAY_NAMES[chunk.data.toolName] || chunk.data.toolName;
+              if (currentToolMessageId) {
+                addSystemMessage(
+                  success
+                    ? `✅ ${displayName}完成`
+                    : `❌ ${displayName}失败`,
+                  'tool_result',
+                  chunk.data.toolName,
+                  undefined,
+                  success ? 'done' : 'failed',
+                  currentToolMessageId
+                );
+              } else {
+                addSystemMessage(
+                  success
+                    ? `✅ ${displayName}完成`
+                    : `❌ ${displayName}失败`,
+                  'tool_result',
+                  chunk.data.toolName,
+                  undefined,
+                  success ? 'done' : 'failed'
+                );
+              }
+              currentToolMessageId = undefined;  // 重置
+              break;
+            case 'state_change':
+              // 更新机器人状态
+              if (chunk.data.state !== 'IDLE') {
+                triggerState(chunk.data.state as AgentState, chunk.data.message, activeTabAgentId);
+              }
+              break;
+            case 'done':
+              // 标记流式消息完成
+              updateStreamMessage(assistantContent, true);
+              break;
+            case 'error':
+              addSystemMessage(`❌ Error: ${chunk.data.message}`, 'status');
+              break;
+          }
+        }
+      );
+
+      // 确保最终结果被设置
+      if (result && result !== assistantContent) {
+        assistantContent = result;
+        updateStreamMessage(result, true);
+      }
 
       // 机器人回到空闲状态
       triggerState('IDLE', 'Ready for next message', activeTabAgentId);
     } catch (error: any) {
       // 添加错误消息
-      const errorMessage: ChatMessage = {
-        id: `msg_${Date.now()}_error`,
-        role: 'assistant',
-        content: `Error: ${error.message}`,
-        timestamp: Date.now(),
-      };
-
-      setChatSessions(prev => {
-        const newMap: Map<string, ChatSession> = new Map(prev);
-        const session = newMap.get(activeTabAgentId) as ChatSession | undefined;
-        if (session) {
-          newMap.set(activeTabAgentId, {
-            ...session,
-            messages: [...session.messages, errorMessage],
-            isProcessing: false
-          });
-        }
-        return newMap;
-      });
+      updateStreamMessage(`Error: ${error.message}`, true);
+      addSystemMessage(`❌ Error: ${error.message}`, 'status');
 
       // 机器人进入错误状态
       triggerState('ERROR', `Chat error: ${error.message}`, activeTabAgentId);

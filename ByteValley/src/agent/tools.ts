@@ -289,12 +289,50 @@ async function executeToolElectron(
       }
 
       case 'search_files': {
+        // 跨平台文件搜索（不依赖 grep）
         const searchPath = pathResolve(workingDir, input.path || '.');
-        const result = execSync(
-          `grep -r "${input.pattern}" ${searchPath} 2>/dev/null || true`,
-          { cwd: workingDir, encoding: 'utf-8' }
-        );
-        return { success: true, content: result.trim() || '未找到匹配结果' };
+        const matches: string[] = [];
+        let searchCount = 0;
+        const MAX_FILES = 1000;
+        const MAX_DEPTH = 10;
+
+        async function searchDir(dirPath: string, depth = 0): Promise<void> {
+          if (depth > MAX_DEPTH || searchCount > MAX_FILES) return;
+
+          try {
+            const entries = fs.readdirSync(dirPath, { withFileTypes: true });
+
+            for (const entry of entries) {
+              searchCount++;
+              const fullPath = pathResolve(dirPath, entry.name);
+
+              if (entry.isDirectory()) {
+                // 跳过 node_modules 和 .git 目录
+                if (entry.name !== 'node_modules' && entry.name !== '.git') {
+                  await searchDir(fullPath, depth + 1);
+                }
+              } else if (entry.isFile()) {
+                try {
+                  const content = fs.readFileSync(fullPath, 'utf-8');
+                  if (content.includes(input.pattern)) {
+                    const relativePath = fullPath.replace(workingDir + '/', '').replace(workingDir + '\\', '');
+                    matches.push(relativePath);
+                  }
+                } catch {
+                  // 忽略无法读取的文件
+                }
+              }
+            }
+          } catch {
+            // 忽略无法访问的目录
+          }
+        }
+
+        await searchDir(searchPath);
+        return {
+          success: true,
+          content: matches.length > 0 ? matches.join('\n') : '未找到匹配结果',
+        };
       }
 
       case 'glob_files': {
