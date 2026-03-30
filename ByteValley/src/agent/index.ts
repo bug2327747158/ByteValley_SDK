@@ -12,6 +12,10 @@ export type {
   GameZone,
   TaskSource,
 
+  // Agent 类型（新架构）
+  AgentType,
+  AgentTypeConfig,
+
   // 配置
   GameAgentConfig,
 
@@ -19,13 +23,13 @@ export type {
   AgentTask,
   TaskExecutionStep,
 
+  // Orchestrator
+  OrchestratorSubTask,
+  OrchestratorResult,
+
   // 环境感知
   EnvironmentScan,
   AutonomousAction,
-
-  // 协作
-  CollaborativeTask,
-  SubTask,
 
   // 事件
   BridgeEventType,
@@ -33,7 +37,57 @@ export type {
   ToolUseCallbackData,
   ToolResultCallbackData,
   MessageCallbackData,
+  UserQuestion,
+  UserQuestionResponse,
 } from './types';
+
+// ==================== 常量导出 ====================
+
+export {
+  AGENT_TYPE_CONFIG,
+  TOOL_TO_STATE,
+  STATE_TO_ZONE,
+} from './types';
+
+// ==================== 消息传递导出 ====================
+
+export {
+  getMessageQueue,
+  resetMessageQueue,
+  sendMessage,
+  broadcastMessage,
+  receiveMessages,
+  getUnreadMessages,
+  replyToMessage,
+  sendCollaborationInvite,
+  sendStatusUpdate,
+} from './AgentMessaging';
+
+export type {
+  AgentMessage,
+  AgentMessageType,
+  MessageOptions,
+} from './AgentMessaging';
+
+// ==================== 共享记忆导出 ====================
+
+export {
+  getSharedMemory,
+  resetSharedMemory,
+  createMemory,
+  recordTaskResult,
+  recordDecision,
+  recordObservation,
+  findRelevantMemories,
+  formatMemoriesAsContext,
+} from './SharedMemory';
+
+export type {
+  SharedMemory,
+  MemoryType,
+  MemorySearchOptions,
+  MemoryRelevance,
+} from './SharedMemory';
 
 // ==================== 工具导出 ====================
 
@@ -42,31 +96,55 @@ export { DEFAULT_TOOLS, executeTool } from './tools';
 
 // ==================== SDK 配置导出 ====================
 
-export { createSDKAgent, sdkConfig, getConfigInfo } from './sdkConfig';
+export { createSDKAgent, sdkConfig, getConfigInfo, setWorkingDirectory, updateSDKConfig } from './sdkConfig';
 
 // ==================== 游戏集成导出 ====================
 
 export {
   initializeGameSDK,
   setGameStateUpdateCallback,
+  setUserQuestionCallback,
+  answerUserQuestion,
   addSDKAgent,
   removeSDKAgent,
   getSDKAgent,
   getSDKAgentIds,
   triggerSDKState,
   executeSDKTask,
+  executeSDKTaskStream,
   quickSDKQuery,
   hasSDK,
   getMapping,
   cleanupAllSDKAgents,
 } from './gameIntegration';
 
-// ==================== 常量导出 ====================
+export type { Agent } from './gameIntegration';
+
+// ==================== Orchestrator 导出 ====================
 
 export {
-  TOOL_TO_STATE,
-  STATE_TO_ZONE,
-} from './types';
+  orchestrateTask,
+  simpleOrchestrate,
+} from './Orchestrator';
+
+export type {
+  OrchestratorConfig,
+} from './Orchestrator';
+
+// ==================== SubAgent Factory 导出 ====================
+
+export {
+  createSubAgent,
+  createSubAgents,
+  cleanupSubAgents,
+  cleanupAllSubAgentsForParent,
+  isTemporarySubAgent,
+  extractSubAgentType,
+} from './SubAgentFactory';
+
+export type {
+  SubAgentOptions,
+} from './SubAgentFactory';
 
 // ==================== AgentBridge 导出 ====================
 
@@ -88,20 +166,6 @@ export {
   getAutonomousStats,
   isAutonomousEnabled,
 } from './Autonomy';
-
-// ==================== TeamCoordination 导出 ====================
-
-export {
-  decomposeTask,
-  assignSubtasks,
-  executeCollaborativeTask,
-  aggregateResults,
-} from './TeamCoordination';
-
-export type {
-  AssignmentStrategy,
-  DecompositionConfig,
-} from './TeamCoordination';
 
 // ==================== 便捷函数 ====================
 
@@ -167,7 +231,7 @@ export function onAllAgentEvents(
   const eventTypes: import('./types').BridgeEventType[] = [
     'state_changed', 'zone_changed', 'task_started', 'task_progress',
     'task_completed', 'task_failed', 'message', 'tool_use', 'tool_result',
-    'error', 'autonomous_action'
+    'error', 'autonomous_action', 'user_question'
   ];
 
   eventTypes.forEach(type => {

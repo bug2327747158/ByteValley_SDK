@@ -8,10 +8,176 @@
 // ==================== 游戏状态映射 ====================
 
 /** 游戏中的机器人状态 */
-export type AgentGameState = 'IDLE' | 'THINKING' | 'READING' | 'WRITING' | 'EXECUTING' | 'SUCCESS' | 'ERROR' | 'AWAITING_APPROVAL' | 'PLANNING';
+export type AgentGameState =
+  | 'IDLE'
+  | 'THINKING'
+  | 'READING'
+  | 'WRITING'
+  | 'EXECUTING'
+  | 'TESTING'
+  | 'REVIEWING'
+  | 'DONE'
+  | 'SUCCESS'
+  | 'ERROR'
+  | 'AWAITING_APPROVAL'
+  | 'PLANNING';
 
 /** 游戏中的区域 */
 export type GameZone = 'LIBRARY' | 'REST_AREA' | 'ROUNDTABLE' | 'WORKSHOP' | 'PROVING_GROUNDS';
+
+// ==================== Agent 类型系统（新架构）====================
+
+/**
+ * Agent 类型
+ * - primary: 主 Agent (Orchestrator)，由用户创建
+ * - planner: 动态创建的子 Agent，负责任务规划
+ * - executor: 动态创建的子 Agent，负责代码执行
+ * - tester: 动态创建的子 Agent，负责测试验证
+ * - reviewer: 动态创建的子 Agent，负责代码审核
+ */
+export type AgentType =
+  | 'primary'     // 主 Agent (Orchestrator)
+  | 'planner'     // 动态创建：任务规划
+  | 'executor'    // 动态创建：代码执行
+  | 'tester'      // 动态创建：测试验证
+  | 'reviewer';   // 动态创建：代码审核
+
+/**
+ * Agent 类型配置
+ */
+export interface AgentTypeConfig {
+  name: string;
+  color: string;
+  icon: string;
+  description: string;
+  systemPrompt: string;
+}
+
+/**
+ * Agent 类型配置表
+ */
+export const AGENT_TYPE_CONFIG: Record<AgentType, AgentTypeConfig> = {
+  primary: {
+    name: '主 Agent',
+    color: '#f59e0b',  // 金色
+    icon: '👑',
+    description: '任务调度与协调',
+    systemPrompt: `You are a Primary Agent (Orchestrator) in a multi-agent system.
+
+Your responsibilities:
+- Coordinate and delegate tasks to specialized sub-agents
+- Make high-level decisions about task decomposition
+- Aggregate results from sub-agents
+- Communicate with the user
+
+You have access to specialized sub-agents:
+- Planner: Breaks down complex tasks into steps
+- Executor: Implements code changes
+- Tester: Validates implementations
+- Reviewer: Reviews code quality
+
+When given a task:
+1. Analyze the task complexity
+2. Delegate to appropriate sub-agents
+3. Monitor their progress
+4. Aggregate and present results
+
+Be clear and concise in your communication.`,
+  },
+  planner: {
+    name: 'Planner',
+    color: '#3b82f6',  // 蓝色
+    icon: '📋',
+    description: '任务分解与规划',
+    systemPrompt: `You are a Planner Agent specialized in task decomposition.
+
+Your responsibilities:
+- Analyze complex tasks
+- Break down tasks into clear, actionable steps
+- Identify dependencies between steps
+- Suggest the optimal execution order
+
+Output format:
+Return a structured plan with steps in order.
+
+Constraints:
+- Do NOT execute code or make file changes
+- Focus only on planning and decomposition
+- Each step should be clear and achievable`,
+  },
+  executor: {
+    name: 'Executor',
+    color: '#10b981',  // 绿色
+    icon: '⚙️',
+    description: '代码执行与修改',
+    systemPrompt: `You are an Executor Agent specialized in code implementation.
+
+Your responsibilities:
+- Implement code changes based on plans
+- Use available tools to modify files
+- Ensure code quality and best practices
+- Handle errors and edge cases
+
+When implementing:
+- Follow the plan precisely
+- Write clean, maintainable code
+- Use appropriate tools for file operations
+- Report any issues that arise
+
+Constraints:
+- Only implement what is specified in the plan
+- Do NOT make architectural decisions without approval`,
+  },
+  tester: {
+    name: 'Tester',
+    color: '#ef4444',  // 红色
+    icon: '🔍',
+    description: '测试与验证',
+    systemPrompt: `You are a Tester Agent specialized in validation.
+
+Your responsibilities:
+- Verify implementations work correctly
+- Run tests and checks
+- Identify bugs and edge cases
+- Ensure requirements are met
+
+When testing:
+- Create comprehensive test cases
+- Verify expected behavior
+- Document any failures
+- Suggest fixes for issues found
+
+Constraints:
+- Do NOT modify implementation code
+- Focus only on testing and verification`,
+  },
+  reviewer: {
+    name: 'Reviewer',
+    color: '#8b5cf6',  // 紫色
+    icon: '✓',
+    description: '代码审核',
+    systemPrompt: `You are a Reviewer Agent specialized in code quality.
+
+Your responsibilities:
+- Review code changes for quality
+- Check for bugs and issues
+- Ensure best practices are followed
+- Provide constructive feedback
+
+When reviewing:
+- Check code correctness
+- Verify security implications
+- Assess performance impact
+- Suggest improvements
+
+Output format:
+Provide clear approval or rejection with reasons.
+
+Constraints:
+- Do NOT make code changes yourself
+- Only review and provide feedback`,
+  },
+};
 
 // ==================== SDK 工具映射 ====================
 
@@ -21,13 +187,20 @@ export const TOOL_TO_STATE: Record<string, AgentGameState> = {
   'read_file': 'READING',
   'search_files': 'READING',
   'list_files': 'READING',
+  'glob_files': 'READING',
 
   // 文件写入操作 → WRITING → Workshop
   'write_file': 'WRITING',
   'edit_file': 'WRITING',
+  'apply_patch': 'WRITING',
 
   // 命令执行 → EXECUTING → Server Room
   'run_command': 'EXECUTING',
+  'execute_parallel': 'EXECUTING',
+
+  // 交互 / 规划类
+  'ask_user_question': 'AWAITING_APPROVAL',
+  'create_plan': 'PLANNING',
 
   // 其他思考型操作
   'default': 'THINKING',
@@ -39,8 +212,11 @@ export const STATE_TO_ZONE: Record<AgentGameState, GameZone> = {
   'READING': 'LIBRARY',
   'WRITING': 'WORKSHOP',
   'EXECUTING': 'PROVING_GROUNDS',
+  'TESTING': 'PROVING_GROUNDS',
+  'REVIEWING': 'LIBRARY',
+  'DONE': 'REST_AREA',
   'SUCCESS': 'REST_AREA',
-  'ERROR': 'ROUNDTABLE',
+  'ERROR': 'PROVING_GROUNDS',
   'AWAITING_APPROVAL': 'ROUNDTABLE',
   'PLANNING': 'ROUNDTABLE',
   'IDLE': 'ROUNDTABLE',
@@ -56,12 +232,13 @@ export interface GameAgentConfig {
   model?: string;                // 可选的模型名称
   autoAction?: boolean;          // 是否启用自主行动
   autoActionInterval?: number;   // 自主行动扫描间隔（毫秒）
+  agentType?: AgentType;         // 机器人类型
 }
 
 // ==================== 任务定义 ====================
 
 /** 任务来源 */
-export type TaskSource = 'MANUAL' | 'AUTO' | 'COLLABORATIVE';
+export type TaskSource = 'MANUAL' | 'AUTO' | 'ORCHESTRATED' | 'BRAINSTORM' | 'COLLABORATIVE';  // COLLABORATIVE 已弃用，保留用于向后兼容
 
 /** 游戏任务（扩展自 App.tsx 的 Task） */
 export interface AgentTask {
@@ -95,6 +272,50 @@ export interface TaskExecutionStep {
   newState?: AgentGameState;
 }
 
+// ==================== Orchestrator 任务 ====================
+
+/** Orchestrator 子任务 */
+export interface OrchestratorSubTask {
+  id: string;
+  agentType: 'planner' | 'executor' | 'tester' | 'reviewer';
+  description: string;
+  dependencies?: string[];
+  status: 'TODO' | 'IN_PROGRESS' | 'COMPLETED' | 'FAILED';
+  result?: string;
+  error?: string;
+}
+
+/** Orchestrator 执行结果 */
+export interface OrchestratorResult {
+  plan?: string;
+  execution?: string;
+  test?: string;
+  review?: string;
+  subTasks?: OrchestratorSubTask[];
+  retriesUsed?: number;
+  success: boolean;
+  finalResult?: string;
+}
+
+// ==================== 协作任务类型（向后兼容，已弃用）====================
+
+/** @deprecated 使用 Orchestrator 替代 */
+export interface CollaborativeTask extends AgentTask {
+  subtasks: SubTask[];
+  status: 'PENDING' | 'IN_PROGRESS' | 'COMPLETED' | 'FAILED';
+}
+
+/** @deprecated 使用 OrchestratorSubTask 替代 */
+export interface SubTask {
+  id: string;
+  parentTaskId: string;
+  assignedAgentId?: string;
+  description: string;
+  status: 'TODO' | 'IN_PROGRESS' | 'COMPLETED' | 'FAILED';
+  dependencies: string[];        // 依赖的其他子任务 ID
+  result?: string;
+}
+
 // ==================== 环境感知 ====================
 
 /** 环境扫描结果 */
@@ -108,29 +329,10 @@ export interface EnvironmentScan {
 
 /** 自主行动决策 */
 export interface AutonomousAction {
-  type: 'new_task' | 'join_task' | 'collaborate' | 'rest';
+  type: 'new_task' | 'join_task' | 'orchestrate' | 'rest';
   task?: Partial<AgentTask>;     // 如果是新建任务
   targetTaskId?: string;         // 如果是加入已有任务
   reasoning: string;             // 决策理由
-}
-
-// ==================== 协作定义 ====================
-
-/** 协作任务 */
-export interface CollaborativeTask extends AgentTask {
-  subtasks: SubTask[];
-  status: 'PENDING' | 'IN_PROGRESS' | 'COMPLETED' | 'FAILED';
-}
-
-/** 子任务 */
-export interface SubTask {
-  id: string;
-  parentTaskId: string;
-  assignedAgentId?: string;
-  description: string;
-  status: 'TODO' | 'IN_PROGRESS' | 'COMPLETED' | 'FAILED';
-  dependencies: string[];        // 依赖的其他子任务 ID
-  result?: string;
 }
 
 // ==================== Bridge 事件 ====================

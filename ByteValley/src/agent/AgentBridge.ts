@@ -6,6 +6,8 @@
  * 2. 自动将 SDK 工具调用映射到游戏状态
  * 3. 任务执行引擎
  * 4. 事件系统
+ * 5. Agent 间消息传递
+ * 6. Agent 类型系统支持
  */
 
 import type {
@@ -21,7 +23,9 @@ import type {
   TaskExecutionStep,
   UserQuestion,
   UserQuestionResponse,
+  AgentType,
 } from './types';
+import { TOOL_TO_STATE, STATE_TO_ZONE } from './types';
 
 import {
   setUserQuestionCallback,
@@ -30,31 +34,8 @@ import {
   clearCurrentExecutingAgentId,
 } from './tools';
 
-// ==================== 状态/工具映射 ====================
-
-const TOOL_TO_STATE: Record<string, AgentGameState> = {
-  'read_file': 'READING',
-  'search_files': 'READING',
-  'list_files': 'READING',
-  'glob_files': 'READING',
-  'write_file': 'WRITING',
-  'edit_file': 'WRITING',
-  'run_command': 'EXECUTING',
-  'ask_user_question': 'AWAITING_APPROVAL',
-  'create_plan': 'PLANNING',
-};
-
-const STATE_TO_ZONE: Record<AgentGameState, GameZone> = {
-  'THINKING': 'ROUNDTABLE',
-  'READING': 'LIBRARY',
-  'WRITING': 'WORKSHOP',
-  'EXECUTING': 'PROVING_GROUNDS',
-  'SUCCESS': 'REST_AREA',
-  'ERROR': 'ROUNDTABLE',
-  'AWAITING_APPROVAL': 'ROUNDTABLE',
-  'PLANNING': 'ROUNDTABLE',
-  'IDLE': 'ROUNDTABLE',
-};
+import { getMessageQueue, sendMessage as queueSendMessage, broadcastMessage as queueBroadcastMessage, type AgentMessage } from './AgentMessaging';
+import { getSharedMemory, type SharedMemory } from './SharedMemory';
 
 // ==================== Agent 实例包装 ====================
 
@@ -574,11 +555,12 @@ export class AgentBridge {
       console.log('[AgentBridge] setUserQuestionCallback invoked with:', question);
       return new Promise((resolve) => {
         const questionId = question.id;
-        const agentId = this.getCurrentAgentId();
+        // 优先使用工具链路传入的 agentId，避免在并发场景下错误回落到 unknown。
+        const agentId = question.agentId || this.getCurrentAgentId() || 'unknown';
 
         const userQuestion: UserQuestion = {
           id: questionId,
-          agentId: agentId || 'unknown',
+          agentId,
           question: question.question,
           options: question.options,
           multiple: question.multiple,
@@ -596,7 +578,7 @@ export class AgentBridge {
         // 发送用户问题事件
         this.emit({
           type: 'user_question',
-          agentId: agentId || 'unknown',
+          agentId,
           timestamp: Date.now(),
           data: { question: userQuestion },
         });
@@ -641,7 +623,7 @@ export class AgentBridge {
         description: `并行执行 ${request.subtasks.length} 个子任务`,
         status: 'IN_PROGRESS',
         createdAt: Date.now(),
-        source: 'COLLABORATIVE',
+        source: 'AUTO',
         subtasks: request.subtasks,
       };
 
@@ -827,6 +809,140 @@ export class AgentBridge {
     }
 
     return results;
+  }
+
+  // ==================== Agent 间消息传递 ====================
+
+  /**
+   * 发送消息给另一个 Agent
+   */
+  sendMessage(from: string, to: string, content: string, type: 'request' | 'notification' = 'request'): string {
+    return queueSendMessage(from, to, content, type);
+  }
+
+  /**
+   * 广播消息给所有 Agent
+   */
+  broadcast(from: string, content: string): string {
+    return queueBroadcastMessage(from, content);
+  }
+
+  /**
+   * 获取 Agent 的消息
+   */
+  getMessages(agentId: string): AgentMessage[] {
+    const queue = getMessageQueue();
+    return queue.getMessages(agentId);
+  }
+
+  /**
+   * 获取并清空 Agent 的消息队列
+   */
+  receiveMessages(agentId: string): AgentMessage[] {
+    const queue = getMessageQueue();
+    return queue.receive(agentId);
+  }
+
+  /**
+   * 获取未读消息数量
+   */
+  getUnreadCount(agentId: string): number {
+    const queue = getMessageQueue();
+    return queue.getUnreadCount(agentId);
+  }
+
+  // ==================== 共享记忆 ====================
+
+  /**
+   * 添加共享记忆
+   */
+  addSharedMemory(memory: SharedMemory): void {
+    const store = getSharedMemory();
+    store.add(memory);
+  }
+
+  /**
+   * 获取相关记忆
+   */
+  getRelevantMemories(taskDescription: string, maxResults: number = 5): SharedMemory[] {
+    const store = getSharedMemory();
+    const relevant = store.getRelevant(taskDescription, maxResults);
+    return relevant.map(r => r.memory);
+  }
+
+  /**
+   * 记录任务结果到共享记忆
+   */
+  recordTaskResult(agentId: string, taskId: string, result: string, success: boolean = true): void {
+    const store = getSharedMemory();
+    store.add({
+      id: '',
+      type: success ? 'result' : 'error',
+      content: result,
+      source: agentId,
+      timestamp: Date.now(),
+      tags: ['task', taskId, success ? 'success' : 'error'],
+      accessCount: 0,
+      lastAccess: Date.now(),
+      metadata: { taskId },
+    });
+  }
+
+  // ==================== Agent 类型系统（新架构）===================
+
+  /**
+   * 设置 Agent 类型
+   */
+  setAgentType(agentId: string, agentType: AgentType): void {
+    const agent = this.agents.get(agentId);
+    if (agent) {
+      agent.config.agentType = agentType;
+    }
+  }
+
+  /**
+   * 获取 Agent 类型
+   */
+  getAgentType(agentId: string): AgentType | undefined {
+    return this.agents.get(agentId)?.config.agentType;
+  }
+
+  /**
+   * 获取所有主 Agent
+   */
+  getPrimaryAgents(): string[] {
+    const primaryAgents: string[] = [];
+    for (const [agentId, agent] of this.agents) {
+      if (agent.config.agentType === 'primary') {
+        primaryAgents.push(agentId);
+      }
+    }
+    return primaryAgents;
+  }
+
+  /**
+   * 推荐主 Agent 用于任务
+   */
+  recommendPrimaryAgentsForTask(taskDescription: string, limit: number = 3): string[] {
+    const recommendations: Array<{ agentId: string; score: number }> = [];
+
+    for (const [agentId, agent] of this.agents) {
+      // 只推荐主 Agent
+      if (agent.config.agentType !== 'primary') continue;
+
+      let score = 0.5; // 默认分数
+
+      // 考虑 Agent 当前状态
+      if (agent.isProcessing) {
+        score *= 0.5;
+      }
+
+      recommendations.push({ agentId, score });
+    }
+
+    // 排序并返回前 N 个
+    recommendations.sort((a, b) => b.score - a.score);
+    return recommendations.slice(0, limit).map(r => r.agentId);
   }
 }
 

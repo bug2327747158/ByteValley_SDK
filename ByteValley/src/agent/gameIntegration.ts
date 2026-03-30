@@ -10,10 +10,23 @@
  * 4. 使用 removeSDKAgent() 处理机器人删除
  */
 
-import type { GameAgentConfig, BridgeEvent } from './types';
+import type { GameAgentConfig, BridgeEvent, AgentType } from './types';
+import { AGENT_TYPE_CONFIG, TOOL_TO_STATE } from './types';
 
 // 重新定义游戏中的类型（避免循环依赖）
-export type AgentState = 'IDLE' | 'THINKING' | 'READING' | 'WRITING' | 'EXECUTING' | 'SUCCESS' | 'ERROR' | 'AWAITING_APPROVAL' | 'PLANNING';
+export type AgentState =
+  | 'IDLE'
+  | 'THINKING'
+  | 'READING'
+  | 'WRITING'
+  | 'EXECUTING'
+  | 'TESTING'
+  | 'REVIEWING'
+  | 'DONE'
+  | 'SUCCESS'
+  | 'ERROR'
+  | 'AWAITING_APPROVAL'
+  | 'PLANNING';
 
 export interface Agent {
   id: string;
@@ -30,9 +43,15 @@ export interface Agent {
   color: string;
   message: string;
   overrideTimeout: number | null;
+  // 新架构字段
+  agentType?: AgentType;           // Agent 类型（primary, planner, executor, tester, reviewer）
+  isPrimaryAgent?: boolean;        // 是否为主 Agent
+  isTemporary?: boolean;           // 是否为临时子 Agent
+  parentAgentId?: string;          // 父 Agent ID（子 Agent 使用）
 }
 import { getAgentBridge } from './AgentBridge';
 import { createSDKAgent } from './sdkConfig';
+import { setCurrentExecutingAgentId, clearCurrentExecutingAgentId } from './tools';
 
 // ==================== 游戏机器人到 SDK 的映射 ====================
 
@@ -55,6 +74,9 @@ const GAME_STATE_TO_SDK: Record<AgentState, import('./types').AgentGameState> = 
   'READING': 'READING',
   'WRITING': 'WRITING',
   'EXECUTING': 'EXECUTING',
+  'TESTING': 'TESTING',
+  'REVIEWING': 'REVIEWING',
+  'DONE': 'DONE',
   'SUCCESS': 'SUCCESS',
   'ERROR': 'ERROR',
   'AWAITING_APPROVAL': 'AWAITING_APPROVAL',
@@ -70,6 +92,9 @@ const SDK_STATE_TO_GAME: Record<import('./types').AgentGameState, AgentState> = 
   'READING': 'READING',
   'WRITING': 'WRITING',
   'EXECUTING': 'EXECUTING',
+  'TESTING': 'TESTING',
+  'REVIEWING': 'REVIEWING',
+  'DONE': 'DONE',
   'SUCCESS': 'SUCCESS',
   'ERROR': 'ERROR',
   'AWAITING_APPROVAL': 'AWAITING_APPROVAL',
@@ -96,6 +121,11 @@ export async function initializeGameSDK(): Promise<void> {
  * 当 SDK 触发状态变化时，调用此回调来更新游戏中的机器人状态
  */
 let gameStateUpdateCallback: ((agentId: string, state: AgentState, message: string) => void) | null = null;
+const lastKnownGameStates = new Map<string, AgentState>();
+let stateChangedListener: ((event: BridgeEvent) => void) | null = null;
+let toolUseListener: ((event: BridgeEvent) => void) | null = null;
+let toolResultListener: ((event: BridgeEvent) => void) | null = null;
+let messageListener: ((event: BridgeEvent) => void) | null = null;
 
 /**
  * 用户问题回调
@@ -120,49 +150,66 @@ export function setGameStateUpdateCallback(
   // 同时设置 bridge 的事件监听
   const bridge = getAgentBridge();
 
-  const handleStateChange = (event: BridgeEvent) => {
+  if (stateChangedListener) bridge.off('state_changed', stateChangedListener);
+  if (toolUseListener) bridge.off('tool_use', toolUseListener);
+  if (toolResultListener) bridge.off('tool_result', toolResultListener);
+  if (messageListener) bridge.off('message', messageListener);
+
+  stateChangedListener = (event: BridgeEvent) => {
     if (event.type === 'state_changed' && gameStateUpdateCallback) {
       const sdkState = event.data.newState;
       const gameState = SDK_STATE_TO_GAME[sdkState];
       const message = event.data.reason || `State changed to ${gameState}`;
+      lastKnownGameStates.set(event.agentId, gameState);
       gameStateUpdateCallback(event.agentId, gameState, message);
     }
   };
 
-  bridge.on('state_changed', handleStateChange);
+  bridge.on('state_changed', stateChangedListener);
 
   // 监听工具使用事件，更新消息
-  bridge.on('tool_use', (event: BridgeEvent) => {
+  toolUseListener = (event: BridgeEvent) => {
     if (gameStateUpdateCallback) {
       const { toolName } = event.data;
+      const nextState = SDK_STATE_TO_GAME[event.data.targetState || 'THINKING']
+        || lastKnownGameStates.get(event.agentId)
+        || 'THINKING';
+      lastKnownGameStates.set(event.agentId, nextState);
       gameStateUpdateCallback(
         event.agentId,
-        SDK_STATE_TO_GAME[event.data.targetState || 'THINKING'],
+        nextState,
         `Using tool: ${toolName}...`
       );
     }
-  });
+  };
+  bridge.on('tool_use', toolUseListener);
 
   // 监听工具结果事件
-  bridge.on('tool_result', (event: BridgeEvent) => {
+  toolResultListener = (event: BridgeEvent) => {
     if (gameStateUpdateCallback) {
       const { toolName, result } = event.data;
-      const gameState = result.success ? 'THINKING' : 'ERROR';
+      const gameState = result.success
+        ? (lastKnownGameStates.get(event.agentId) || 'THINKING')
+        : 'ERROR';
+      lastKnownGameStates.set(event.agentId, gameState);
       gameStateUpdateCallback(
         event.agentId,
         gameState,
         `Tool ${toolName}: ${result.success ? '✅ Done' : '❌ Failed'}`
       );
     }
-  });
+  };
+  bridge.on('tool_result', toolResultListener);
 
   // 监听消息事件
-  bridge.on('message', (event: BridgeEvent) => {
+  messageListener = (event: BridgeEvent) => {
     if (gameStateUpdateCallback) {
       // 消息事件不改变状态，但更新显示
-      gameStateUpdateCallback(event.agentId, 'THINKING', event.data.content);
+      const gameState = lastKnownGameStates.get(event.agentId) || 'THINKING';
+      gameStateUpdateCallback(event.agentId, gameState, event.data.content);
     }
-  });
+  };
+  bridge.on('message', messageListener);
 }
 
 /**
@@ -229,48 +276,54 @@ export function answerUserQuestion(
  * 添加一个新的 SDK 机器人
  * 替换游戏中的 addAgent 函数
  *
- * @param gameAgent 游戏中的 Agent 对象
- * @param colors 颜色数组（用于分配颜色）
+ * @param baseAgent 游戏中的 Agent 对象（部分属性）
+ * @param agentType Agent 类型（默认为 primary）
  * @returns 完整的游戏 Agent 对象
  */
 export async function addSDKAgent(
   baseAgent: Partial<Agent>,
-  colors: string[]
+  agentType: AgentType = 'primary'
 ): Promise<Agent> {
   // 生成游戏 Agent
   const agentId = baseAgent.id || `agent-${Math.random().toString(36).substr(2, 9)}`;
-  const colorIndex = mappings.size % colors.length;
+  const typeConfig = AGENT_TYPE_CONFIG[agentType];
 
   const gameAgent: Agent = {
     id: agentId,
-    x: baseAgent.x || 688,  // 默认在中间
-    y: baseAgent.y || 420,
-    targetX: baseAgent.targetX || 688,
-    targetY: baseAgent.targetY || 420,
-    state: baseAgent.state || 'IDLE',
-    message: baseAgent.message || 'Hello! I\'m ready to help.',
-    color: baseAgent.color || colors[colorIndex],
+    x: baseAgent.x ?? 688,  // 默认在中间
+    y: baseAgent.y ?? 420,
+    targetX: baseAgent.targetX ?? 688,
+    targetY: baseAgent.targetY ?? 420,
+    state: baseAgent.state ?? 'IDLE',
+    message: baseAgent.message || `${typeConfig.icon} Ready to help!`,
+    color: baseAgent.color || typeConfig.color,
     facing: baseAgent.facing || 'right',
-    speed: baseAgent.speed || 150,
+    speed: baseAgent.speed ?? 150,
     frame: 0,
     animationVariant: Math.floor(Math.random() * 3),
     overrideMode: undefined,
     overrideTimeout: null,
+    // 新架构字段
+    agentType,
+    isPrimaryAgent: agentType === 'primary',
+    isTemporary: agentType !== 'primary',
+    parentAgentId: baseAgent.parentAgentId,
   };
 
   // 创建 SDK Agent
   try {
-    console.log(`[gameIntegration] Creating SDK agent for ${agentId}...`);
-    const sdkAgent = await createSDKAgent();
+    console.log(`[gameIntegration] Creating SDK agent for ${agentId}...`, { agentType });
+    const sdkAgent = await createSDKAgent({ agentId, agentType });
 
     // 注册到 Bridge
     const bridge = getAgentBridge();
     bridge.registerAgent(
       {
         id: agentId,
-        name: `Agent ${agentId}`,
+        name: `${typeConfig.name} (${agentId.slice(-6)})`,
         apiKey: sdkAgent.config.apiKey,
         model: sdkAgent.config.model,
+        agentType,
       },
       sdkAgent
     );
@@ -443,9 +496,14 @@ export async function executeSDKTaskStream(
 
   // 发送初始状态
   onChunk({ type: 'state_change', data: { state: 'THINKING', message: 'Starting task...' } });
+  let currentState: AgentState = 'THINKING';
+  lastKnownGameStates.set(agentId, currentState);
 
   let finalResponse = '';
 
+  // 流式路径会直接调用 sdkAgent.run（不经过 AgentBridge.runWithStateTracking），
+  // 这里需要显式设置当前执行 agent，确保 ask_user_question 拿到正确 agentId。
+  setCurrentExecutingAgentId(agentId);
   try {
     // 使用 SDK 的 run 方法，通过回调实现流式效果
     const result = await mapping.sdkAgent.run(description, {
@@ -458,17 +516,19 @@ export async function executeSDKTaskStream(
       },
       // 工具调用回调
       onToolUse: (name: string, input: any) => {
+        currentState = TOOL_TO_STATE[name] || TOOL_TO_STATE.default || currentState || 'THINKING';
+        lastKnownGameStates.set(agentId, currentState);
         // 只发送一次，直接设为执行中状态（简化版）
         onChunk({
           type: 'tool_use',
           data: {
             toolName: name,
             input,
-            targetState: TOOL_TO_STATE[name] || 'THINKING',
+            targetState: currentState,
             status: 'executing'
           }
         });
-        onChunk({ type: 'state_change', data: { state: TOOL_TO_STATE[name] || 'THINKING', message: `Using tool: ${name}...` } });
+        onChunk({ type: 'state_change', data: { state: currentState, message: `Using tool: ${name}...` } });
       },
       // 工具结果回调
       onToolResult: (name: string, result: any) => {
@@ -480,35 +540,30 @@ export async function executeSDKTaskStream(
             success: result.success
           }
         });
-        // 工具执行后回到思考状态
-        onChunk({ type: 'state_change', data: { state: 'THINKING', message: `Completed tool: ${name}` } });
+        if (!result.success) {
+          currentState = 'ERROR';
+        }
+        lastKnownGameStates.set(agentId, currentState);
+        // 工具执行后保持当前状态，避免状态抖动回 THINKING
+        onChunk({ type: 'state_change', data: { state: currentState, message: `Completed tool: ${name}` } });
       },
     });
 
     // 任务完成
     onChunk({ type: 'done', data: { result } });
     onChunk({ type: 'state_change', data: { state: 'IDLE', message: 'Task completed' } });
+    lastKnownGameStates.set(agentId, 'IDLE');
 
     return result;
   } catch (error: any) {
     onChunk({ type: 'error', data: { message: error.message } });
     onChunk({ type: 'state_change', data: { state: 'ERROR', message: `Error: ${error.message}` } });
+    lastKnownGameStates.set(agentId, 'ERROR');
     throw error;
+  } finally {
+    clearCurrentExecutingAgentId();
   }
 }
-
-// 工具到状态的映射
-const TOOL_TO_STATE: Record<string, import('./types').AgentGameState> = {
-  'read_file': 'READING',
-  'search_files': 'READING',
-  'list_files': 'READING',
-  'glob_files': 'READING',
-  'write_file': 'WRITING',
-  'edit_file': 'WRITING',
-  'run_command': 'EXECUTING',
-  'ask_user_question': 'AWAITING_APPROVAL',
-  'create_plan': 'PLANNING',
-};
 
 /**
  * 快速查询（不触发工具）

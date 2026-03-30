@@ -22,3 +22,98 @@
 .custom-scrollbar::-webkit-scrollbar-thumb:hover {
   background: #4b5563;
 }
+
+.cli-md {
+  color: inherit;
+  font-family: var(--font-sans);
+  line-height: 1.5;
+}
+
+.cli-md > * + * {
+  margin-top: 0.5rem;
+}
+
+.cli-md p,
+.cli-md li {
+  white-space: pre-wrap;
+}
+
+.cli-md h1,
+.cli-md h2,
+.cli-md h3,
+.cli-md h4,
+.cli-md h5,
+.cli-md h6 {
+  color: #fef08a;
+  font-weight: 600;
+}
+
+.cli-md ul,
+.cli-md ol {
+  padding-left: 1.25rem;
+}
+
+.cli-md ul {
+  list-style: disc;
+}
+
+.cli-md ol {
+  list-style: decimal;
+}
+
+.cli-md pre {
+  overflow-x: auto;
+  border: 1px solid #3f3f46;
+  background: rgba(24, 24, 27, 0.95);
+  border-radius: 0.375rem;
+  padding: 0.6rem;
+  white-space: pre;
+}
+
+.cli-md code {
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+}
+
+.cli-md :not(pre) > code {
+  border: 1px solid #3f3f46;
+  background: rgba(39, 39, 42, 0.9);
+  border-radius: 0.25rem;
+  padding: 0.08rem 0.3rem;
+}
+
+.cli-md blockquote {
+  border-left: 3px solid #52525b;
+  margin: 0;
+  padding-left: 0.65rem;
+  color: #d4d4d8;
+}
+
+.cli-md hr {
+  border: 0;
+  border-top: 1px solid #3f3f46;
+}
+
+.cli-md table {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  overflow-x: auto;
+  border-collapse: collapse;
+}
+
+.cli-md th,
+.cli-md td {
+  border: 1px solid #52525b;
+  padding: 0.35rem 0.5rem;
+  text-align: left;
+}
+
+.cli-md th {
+  background: rgba(39, 39, 42, 0.95);
+}
+
+.cli-md-link {
+  color: #6ee7b7;
+  text-decoration: underline;
+}

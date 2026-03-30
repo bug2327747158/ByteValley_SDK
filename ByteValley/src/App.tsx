@@ -4,7 +4,16 @@
  */
 
 import React, { useEffect, useRef, useState } from 'react';
-import { Minus, Square, X, Play, Search, Edit3, Terminal, CheckCircle, Coffee, AlertTriangle, Folder, Bot, Trash2 } from 'lucide-react';
+import { Minus, Square, X, Play, Search, Edit3, Terminal, CheckCircle, Coffee, AlertTriangle, Folder, Bot, Trash2, Settings } from 'lucide-react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+import {
+  sdkConfig,
+  setWorkingDirectory as setSDKWorkingDirectory,
+  updateSDKConfig,
+  testSDKConnectivity,
+  type SDKConnectivityTestResult,
+} from './agent/sdkConfig';
 
 // 🤖 SDK Integration
 import {
@@ -20,13 +29,43 @@ import {
 } from './agent/gameIntegration';
 import { exposeTestFunctions, TEST_PROMPTS } from './agent/testTools';
 
+// 🤖 Agent Type System (New Architecture)
+import type { AgentType } from './agent/types';
+import { AGENT_TYPE_CONFIG } from './agent/types';
+import {
+  type BrainstormSessionState,
+  type BrainstormPhase,
+  type BrainstormEventType,
+  type BrainstormRole,
+  type BrainstormDiscussionStage,
+  buildArtifactPaths,
+  transcriptFromMessages,
+  buildRoleDiscussionPrompt,
+  buildOptionsPrompt,
+  buildSpecPrompt,
+  buildPlanPrompt,
+} from './agent/BrainstormCoordinator';
+
 // --- Constants & Types ---
 const CANVAS_WIDTH = 1376;
 const CANVAS_HEIGHT = 768;
 
-type AgentState = 'IDLE' | 'THINKING' | 'READING' | 'WRITING' | 'EXECUTING' | 'SUCCESS' | 'ERROR' | 'AWAITING_APPROVAL' | 'PLANNING';
+type AgentState =
+  | 'IDLE'
+  | 'THINKING'
+  | 'READING'
+  | 'WRITING'
+  | 'EXECUTING'
+  | 'TESTING'
+  | 'REVIEWING'
+  | 'DONE'
+  | 'SUCCESS'
+  | 'ERROR'
+  | 'AWAITING_APPROVAL'
+  | 'PLANNING';
 type ViewState = 'MAIN' | 'BULLETIN' | 'ROUNDTABLE_CHAT' | 'CLI_CHAT';
 type TaskStatus = 'TODO' | 'IN_PROGRESS' | 'COMPLETED' | 'FAILED';
+type ExecutionMode = 'single' | 'multi';
 
 // 工具执行状态
 type ToolExecutionStatus = 'preparing' | 'executing' | 'done' | 'failed';
@@ -40,6 +79,105 @@ const TOOL_DISPLAY_NAMES: Record<string, string> = {
   'run_command': '执行命令',
   'search_files': '搜索文件',
   'glob_files': '匹配文件',
+};
+
+const MANUAL_STATE_CHANGE_MESSAGE = 'manual state change';
+const WRITE_TOOLS = new Set(['write_file', 'edit_file', 'apply_patch']);
+
+const isManualStateChangeMessage = (message?: string): boolean => {
+  if (typeof message !== 'string') return false;
+  return message.trim().toLowerCase() === MANUAL_STATE_CHANGE_MESSAGE;
+};
+
+const isWriteTool = (toolName?: string): boolean => {
+  return !!toolName && WRITE_TOOLS.has(toolName);
+};
+
+const extractFilesFromPatch = (patchText: string): string[] => {
+  if (!patchText) return [];
+  const files = new Set<string>();
+
+  for (const line of patchText.split('\n')) {
+    let match = line.match(/^\*\*\* (?:Add|Update|Delete) File: (.+)$/);
+    if (match?.[1]) {
+      files.add(match[1].trim());
+      continue;
+    }
+    match = line.match(/^\*\*\* Move to: (.+)$/);
+    if (match?.[1]) {
+      files.add(match[1].trim());
+      continue;
+    }
+    match = line.match(/^\+\+\+ b\/(.+)$/);
+    if (match?.[1]) {
+      files.add(match[1].trim());
+      continue;
+    }
+    match = line.match(/^--- a\/(.+)$/);
+    if (match?.[1]) {
+      files.add(match[1].trim());
+    }
+  }
+
+  return Array.from(files);
+};
+
+const extractWriteFiles = (toolName?: string, input?: any, result?: any): string[] => {
+  const files = new Set<string>();
+
+  if (input?.path && typeof input.path === 'string') {
+    files.add(input.path);
+  }
+
+  if (toolName === 'apply_patch' && typeof input?.patch === 'string') {
+    extractFilesFromPatch(input.patch).forEach(file => files.add(file));
+  }
+
+  const resultText = typeof result?.content === 'string'
+    ? result.content
+    : typeof result === 'string'
+      ? result
+      : '';
+  if (resultText) {
+    const matchedPath = resultText.match(/(?:文件已写入|文件已编辑|新文件已创建（模拟）|文件已编辑（模拟）)[:：]\s*([^\n\r]+)/);
+    if (matchedPath?.[1]) {
+      files.add(matchedPath[1].trim());
+    }
+  }
+
+  return Array.from(files);
+};
+
+const formatChangedFiles = (files: string[]): string => {
+  if (files.length === 0) return '未知文件';
+  if (files.length <= 3) return files.join(', ');
+  return `${files.slice(0, 3).join(', ')} 等 ${files.length} 个文件`;
+};
+
+const CliMarkdownContent = ({ content }: { content: string }) => {
+  return (
+    <div className="cli-md break-words">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        skipHtml
+        components={{
+          a: ({ href, children, ...props }: any) => (
+            <a
+              {...props}
+              href={href}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="cli-md-link"
+            >
+              {children}
+            </a>
+          ),
+        }}
+      >
+        {content}
+      </ReactMarkdown>
+    </div>
+  );
 };
 
 // 聊天消息类型
@@ -78,6 +216,8 @@ interface Task {
   sdkPrompt?: string;         // 发送给 SDK 的提示词
   result?: string;            // 执行结果
   error?: string;             // 错误信息
+  source?: 'MANUAL' | 'AUTO' | 'ORCHESTRATED' | 'BRAINSTORM';  // 任务来源
+  executionMode?: ExecutionMode; // 执行模式：单 Agent / 多 Agent
 }
 
 interface Zone {
@@ -120,6 +260,63 @@ interface Agent {
   color: string;
   message: string;
   overrideTimeout: number | null;
+  // New architecture fields
+  agentType?: AgentType;           // Agent 类型（primary, planner, executor, tester, reviewer）
+  isPrimaryAgent?: boolean;        // 是否为主 Agent
+  isTemporary?: boolean;           // 是否为临时子 Agent
+  parentAgentId?: string;          // 父 Agent ID（子 Agent 使用）
+  lastMessage?: string;  // 存储最后一条消息（用于气泡同步）
+  currentTool?: string;  // 当前执行的工具
+  gestureType?: 'spawn' | 'cleanup';
+  gestureUntil?: number;
+  freezeUntil?: number;
+}
+
+interface SubAgentVisualPayload {
+  id: string;
+  x?: number;
+  y?: number;
+  agentType?: AgentType;
+  parentAgentId?: string;
+  isTemporary?: boolean;
+  color?: string;
+  message?: string;
+}
+
+interface SubAgentLink {
+  parentId: string;
+  childId: string;
+  createdAt: number;
+  pulling?: boolean;
+}
+
+interface LinkPulse {
+  id: string;
+  parentId: string;
+  childId: string;
+  direction: 'parent_to_child' | 'child_to_parent';
+  createdAt: number;
+  duration: number;
+  color?: string;
+}
+
+interface PortalEffect {
+  id: string;
+  type: 'black' | 'white';
+  x: number;
+  y: number;
+  createdAt: number;
+  duration: number;
+  parentId: string;
+}
+
+interface AbsorbEffect {
+  agentId: string;
+  parentId: string;
+  startX: number;
+  startY: number;
+  startAt: number;
+  duration: number;
 }
 
 // --- Components ---
@@ -135,7 +332,12 @@ const BulletinBoard = ({
   onUpdateSupplementaryInput,
   agentsData,
   onAssignTask,
-  onExecuteTask
+  onExecuteTask,
+  selectedAgentForSingleMode,
+  setSelectedAgentForSingleMode,
+  executionMode,
+  setExecutionMode,
+  onError,
 }: any) => {
   const statusConfig: Record<TaskStatus, { label: string, color: string }> = {
     TODO: { label: 'TO DO', color: 'bg-blue-500' },
@@ -171,14 +373,72 @@ const BulletinBoard = ({
 
           {/* New Task Input */}
           <div className="flex flex-col gap-3 mb-6 bg-[#3d2b25]/80 p-3 border-2 border-[#4d352e]">
-            <input 
-              type="text" 
+            {/* Agent 选择器 */}
+            <div className="bg-black/30 p-2 border-2 border-[#4d352e]">
+              <div className="text-[9px] text-[#fef08a] mb-2">👑 Select Primary Agent:</div>
+              {agentsData.length === 0 ? (
+                <div className="text-[8px] text-red-400 italic">
+                  No agents available! Click + button to add one.
+                </div>
+              ) : (
+                <div className="flex gap-2 flex-wrap">
+                  {agentsData.filter(a => a.isPrimaryAgent !== false).map((agent) => (
+                    <button
+                      key={agent.id}
+                      onClick={() => setSelectedAgentForSingleMode(agent.id)}
+                      className={`px-3 py-2 border-2 text-[10px] transition-all font-bold ${
+                        selectedAgentForSingleMode === agent.id
+                          ? 'bg-[#fef08a] border-[#fef08a] text-black shadow-[0_0_8px_rgba(254,240,138,0.5)]'
+                          : 'bg-black/60 border-[#4d352e] text-[#a8a29e] hover:border-[#fef08a] hover:text-[#fef08a]'
+                      }`}
+                    >
+                      {agent.agentType === 'primary' ? '👑 ' : ''}{agent.id}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* 执行模式切换 */}
+            <div className="bg-black/30 p-2 border-2 border-[#4d352e]">
+              <div className="text-[9px] text-[#fef08a] mb-2">⚙️ Execution Mode:</div>
+              <div className="flex gap-2">
+                <button
+                  onClick={() => setExecutionMode('single')}
+                  className={`px-3 py-2 border-2 text-[10px] transition-all font-bold ${
+                    executionMode === 'single'
+                      ? 'bg-[#60a5fa] border-[#60a5fa] text-black'
+                      : 'bg-black/60 border-[#4d352e] text-[#a8a29e] hover:border-[#60a5fa] hover:text-[#60a5fa]'
+                  }`}
+                >
+                  SINGLE AGENT
+                </button>
+                <button
+                  onClick={() => setExecutionMode('multi')}
+                  className={`px-3 py-2 border-2 text-[10px] transition-all font-bold ${
+                    executionMode === 'multi'
+                      ? 'bg-[#fef08a] border-[#fef08a] text-black'
+                      : 'bg-black/60 border-[#4d352e] text-[#a8a29e] hover:border-[#fef08a] hover:text-[#fef08a]'
+                  }`}
+                >
+                  MULTI AGENT
+                </button>
+              </div>
+              <div className="mt-2 text-[8px] text-zinc-400">
+                {executionMode === 'multi'
+                  ? 'Primary Agent will use Orchestrator (Planner → Executor → Tester → Reviewer).'
+                  : 'Use direct single-agent execution for faster simple tasks.'}
+              </div>
+            </div>
+
+            <input
+              type="text"
               value={newTaskTitle}
               onChange={(e) => setNewTaskTitle(e.target.value)}
               placeholder="Enter new mission..."
               className="w-full bg-black/20 border-2 border-[#4d352e] px-3 py-2 text-[#fef08a] text-[10px] placeholder:text-zinc-500 focus:outline-none"
             />
-            <button 
+            <button
               onClick={onAddTask}
               className="w-full bg-emerald-700 hover:bg-emerald-500 text-white px-4 py-2 border-2 border-emerald-900 text-[10px] font-bold uppercase tracking-wider cursor-pointer transition-colors"
             >
@@ -196,19 +456,24 @@ const BulletinBoard = ({
                       <div className={`w-2 h-2 rounded-full ${statusConfig[task.status].color} shadow-[0_0_4px_rgba(255,255,255,0.5)]`} />
                       <span className="text-[10px] font-bold text-[#fef08a]">{task.title}</span>
                     </div>
-                    <span className="text-[8px] text-zinc-400">{statusConfig[task.status].label}</span>
+                    <div className="flex items-center gap-2">
+                      <span className="text-[8px] text-zinc-400">
+                        {(task.executionMode || 'multi').toUpperCase()}
+                      </span>
+                      <span className="text-[8px] text-zinc-400">{statusConfig[task.status].label}</span>
+                    </div>
                   </div>
                   
                   {expandedTaskId === task.id && (
                     <div className="mt-3 pt-3 border-t-2 border-[#3d251e] flex flex-col gap-4 bg-black/30 -mx-2 px-2 -my-2 py-2 rounded" onClick={(e) => e.stopPropagation()}>
-                      {/* 分配机器人 - More prominent */}
+                      {/* 分配机器人 */}
                       <div className="flex flex-col gap-2">
-                        <label className="text-[10px] text-[#fef08a] uppercase font-bold animate-pulse">🤖 ASSIGN AGENT:</label>
+                        <label className="text-[10px] text-[#fef08a] uppercase font-bold animate-pulse">👑 ASSIGN PRIMARY AGENT:</label>
                         <div className="flex gap-2 flex-wrap">
-                          {agentsData.length === 0 ? (
-                            <div className="text-[8px] text-zinc-500 italic">No agents available. Click + button to add one!</div>
+                          {agentsData.filter(a => a.isPrimaryAgent !== false).length === 0 ? (
+                            <div className="text-[8px] text-zinc-500 italic">No primary agents available. Click + button to add one!</div>
                           ) : (
-                            agentsData.map((agent) => (
+                            agentsData.filter(a => a.isPrimaryAgent !== false).map((agent) => (
                               <button
                                 key={agent.id}
                                 onClick={() => onAssignTask && onAssignTask(task.id, agent.id)}
@@ -218,7 +483,7 @@ const BulletinBoard = ({
                                     : 'bg-black/60 border-[#4d352e] text-[#a8a29e] hover:border-[#fef08a] hover:text-[#fef08a]'
                                 }`}
                               >
-                                {agent.id}
+                                {agent.agentType === 'primary' ? '👑 ' : ''}{agent.id}
                               </button>
                             ))
                           )}
@@ -232,6 +497,8 @@ const BulletinBoard = ({
                           )}
                         </div>
                       </div>
+
+                      {/* 执行按钮 - More prominent */}
 
                       {/* 执行按钮 - More prominent */}
                       {task.agentId && task.status === 'TODO' && (
@@ -290,52 +557,227 @@ const BulletinBoard = ({
   );
 };
 
-const RoundtableChat = ({ onClose }: { onClose: () => void }) => {
+const BRAINSTORM_PHASE_LABELS: Record<BrainstormPhase, string> = {
+  IDLE: 'Idle',
+  SUMMONING: 'Summoning',
+  CLARIFYING: 'Clarifying',
+  OPTIONS: 'Evaluating Options',
+  DESIGNING: 'Designing',
+  SPEC_READY: 'Spec Ready',
+  PLAN_READY: 'Plan Ready',
+  APPROVAL_PENDING: 'Approval Pending',
+  EXECUTING: 'Executing',
+  FINISHED: 'Finished',
+  ERROR: 'Error',
+};
+
+const BRAINSTORM_ROLE_ORDER: BrainstormRole[] = ['planner', 'reviewer', 'executor'];
+
+const BRAINSTORM_ROLE_META: Record<BrainstormRole, {
+  index: number;
+  state: AgentState;
+  dispatchColor: string;
+  roleName: string;
+}> = {
+  planner: {
+    index: 0,
+    state: 'PLANNING',
+    dispatchColor: 'rgba(250,204,21,0.95)',
+    roleName: 'Planner',
+  },
+  reviewer: {
+    index: 1,
+    state: 'REVIEWING',
+    dispatchColor: 'rgba(168,85,247,0.95)',
+    roleName: 'Reviewer',
+  },
+  executor: {
+    index: 2,
+    state: 'EXECUTING',
+    dispatchColor: 'rgba(34,197,94,0.95)',
+    roleName: 'Executor',
+  },
+};
+
+const RoundtableChat = ({
+  session,
+  onClose,
+  onSendMessage,
+  onGenerateOptions,
+  onGenerateSpec,
+  onGeneratePlan,
+  onApproveAndExecute,
+  onFinishWithoutExecution,
+}: {
+  session: BrainstormSessionState;
+  onClose: () => void;
+  onSendMessage: (message: string) => Promise<void>;
+  onGenerateOptions: () => Promise<void>;
+  onGenerateSpec: () => Promise<void>;
+  onGeneratePlan: () => Promise<void>;
+  onApproveAndExecute: () => Promise<void>;
+  onFinishWithoutExecution: () => void;
+}) => {
+  const [input, setInput] = useState('');
+  const messagesEndRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [session.messages, session.phase, session.isBusy]);
+
+  const canSend = !session.isBusy && (session.phase === 'CLARIFYING' || session.phase === 'OPTIONS');
+  const showGenerateOptions = session.phase === 'CLARIFYING';
+  const showGenerateSpec = session.phase === 'OPTIONS';
+  const showGeneratePlan = session.phase === 'SPEC_READY' || session.phase === 'PLAN_READY';
+  const showApproval = session.phase === 'APPROVAL_PENDING';
+  const canClose = session.phase !== 'EXECUTING' && !session.isBusy;
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const text = input.trim();
+    if (!text || !canSend) return;
+    setInput('');
+    await onSendMessage(text);
+  };
+
   return (
-    <div 
+    <div
       className="absolute inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4"
-      onClick={onClose}
+      onClick={() => {
+        if (canClose) onClose();
+      }}
     >
-      <div 
-        className="relative w-full max-w-[600px] h-[500px] bg-zinc-900 shadow-2xl border-4 border-[#3d251e] rounded-lg flex flex-col"
+      <div
+        className="relative w-full max-w-[760px] h-[560px] bg-zinc-900 shadow-2xl border-4 border-[#3d251e] rounded-lg flex flex-col"
         style={{ imageRendering: 'pixelated', fontFamily: '"Press Start 2P", cursive' }}
         onClick={(e) => e.stopPropagation()}
       >
-        {/* Header */}
         <div className="bg-[#3d251e] p-3 flex justify-between items-center border-b-4 border-black">
           <h2 className="text-sm font-bold text-[#fef08a] tracking-wider">BRAINSTORMING MODE</h2>
-          <button 
-            onClick={onClose}
-            className="text-[#fef08a] hover:text-red-400 font-bold text-sm"
-          >
-            [X]
-          </button>
-        </div>
-        
-        {/* Chat Area */}
-        <div className="flex-1 p-4 overflow-y-auto bg-black/40 flex flex-col gap-4 text-[10px] leading-relaxed">
-          <div className="text-zinc-500 italic text-center mb-2">-- ROUNDTABLE SESSION STARTED --</div>
-          
-          <div className="flex gap-3 items-start">
-            <div className="w-8 h-8 bg-emerald-900 border-2 border-emerald-500 rounded flex items-center justify-center shrink-0">
-              <span className="text-emerald-400 text-xs">🤖</span>
-            </div>
-            <div className="bg-zinc-800 border-2 border-zinc-700 p-3 rounded-r-lg rounded-bl-lg text-emerald-400">
-              All agents are in position. What are we brainstorming today?
-            </div>
+          <div className="flex items-center gap-3">
+            <span className={`text-[9px] ${session.isBusy ? 'text-yellow-300' : 'text-emerald-300'}`}>
+              {session.isBusy ? 'RUNNING' : BRAINSTORM_PHASE_LABELS[session.phase]}
+            </span>
+            <button
+              onClick={onClose}
+              disabled={!canClose}
+              className="text-[#fef08a] hover:text-red-400 disabled:text-zinc-500 disabled:hover:text-zinc-500 font-bold text-sm"
+            >
+              [X]
+            </button>
           </div>
         </div>
-        
-        {/* Input Area */}
-        <div className="p-3 border-t-4 border-[#3d251e] bg-zinc-900 flex gap-2">
-          <input 
-            type="text" 
-            placeholder="Type your idea here..." 
-            className="flex-1 bg-black border-2 border-zinc-700 p-3 text-[#fef08a] text-[10px] focus:outline-none focus:border-emerald-500" 
+
+        <div className="px-4 py-2 border-b border-zinc-700 text-[9px] text-zinc-300 bg-black/30">
+          Topic: <span className="text-[#fef08a]">{session.topic || 'Untitled brainstorm'}</span>
+        </div>
+
+        <div className="flex-1 p-4 overflow-y-auto bg-black/40 flex flex-col gap-3 text-[10px] leading-relaxed">
+          {session.messages.length === 0 && (
+            <div className="text-zinc-500 italic text-center mb-2">-- ROUNDTABLE SESSION STARTED --</div>
+          )}
+
+          {session.messages.map(msg => (
+            <div key={msg.id} className={`flex gap-3 items-start ${msg.role === 'user' ? 'justify-end' : ''}`}>
+              {msg.role !== 'user' && (
+                <div className="w-8 h-8 bg-emerald-900 border-2 border-emerald-500 rounded flex items-center justify-center shrink-0">
+                  <span className="text-emerald-400 text-xs">🤖</span>
+                </div>
+              )}
+              <div className={`max-w-[80%] p-3 border-2 ${
+                msg.role === 'user'
+                  ? 'bg-[#5d4037] border-[#8d6e63] rounded-l-lg rounded-br-lg text-[#fef08a]'
+                  : msg.role === 'system'
+                    ? 'bg-zinc-800 border-zinc-700 rounded-lg text-zinc-300'
+                    : 'bg-zinc-900 border-emerald-800 rounded-r-lg rounded-bl-lg text-emerald-300'
+              }`}>
+                {msg.agentId && (
+                  <div className="text-[8px] opacity-70 mb-1">Agent: {msg.agentId}</div>
+                )}
+                {msg.role === 'user' ? (
+                  <div className="whitespace-pre-wrap break-words">{msg.content}</div>
+                ) : (
+                  <CliMarkdownContent content={msg.content} />
+                )}
+              </div>
+            </div>
+          ))}
+
+          {(session.specPath || session.planPath) && (
+            <div className="mt-2 p-3 border border-zinc-700 bg-black/50 text-[9px] text-zinc-300">
+              <div className="text-[#fef08a] mb-2">Artifacts</div>
+              {session.specPath && <div>Spec: {session.specPath}</div>}
+              {session.planPath && <div>Plan: {session.planPath}</div>}
+            </div>
+          )}
+
+          <div ref={messagesEndRef} />
+        </div>
+
+        <form onSubmit={handleSubmit} className="p-3 border-t border-zinc-800 bg-zinc-900 flex gap-2">
+          <input
+            type="text"
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            disabled={!canSend}
+            placeholder={canSend ? 'Describe goals, constraints, or tradeoffs...' : 'Conversation locked for this phase'}
+            className="flex-1 bg-black border-2 border-zinc-700 p-3 text-[#fef08a] text-[10px] focus:outline-none focus:border-emerald-500 disabled:opacity-50"
           />
-          <button className="bg-emerald-700 hover:bg-emerald-600 text-white font-bold text-[10px] px-4 py-2 border-b-4 border-emerald-900 active:border-b-0 active:translate-y-1">
+          <button
+            type="submit"
+            disabled={!canSend || !input.trim()}
+            className="bg-emerald-700 hover:bg-emerald-600 disabled:bg-zinc-700 disabled:text-zinc-400 text-white font-bold text-[10px] px-4 py-2 border-b-4 border-emerald-900 active:border-b-0 active:translate-y-1"
+          >
             SEND
           </button>
+        </form>
+
+        <div className="p-3 border-t border-zinc-800 bg-black/50 flex flex-wrap gap-2">
+          {showGenerateOptions && (
+            <button
+              onClick={() => { void onGenerateOptions(); }}
+              disabled={session.isBusy}
+              className="bg-yellow-700 hover:bg-yellow-600 disabled:bg-zinc-700 text-white text-[10px] px-3 py-2"
+            >
+              生成候选方案
+            </button>
+          )}
+          {showGenerateSpec && (
+            <button
+              onClick={() => { void onGenerateSpec(); }}
+              disabled={session.isBusy}
+              className="bg-blue-700 hover:bg-blue-600 disabled:bg-zinc-700 text-white text-[10px] px-3 py-2"
+            >
+              生成 Spec
+            </button>
+          )}
+          {showGeneratePlan && (
+            <button
+              onClick={() => { void onGeneratePlan(); }}
+              disabled={session.isBusy}
+              className="bg-indigo-700 hover:bg-indigo-600 disabled:bg-zinc-700 text-white text-[10px] px-3 py-2"
+            >
+              生成 Plan
+            </button>
+          )}
+          {showApproval && (
+            <>
+              <button
+                onClick={() => { void onApproveAndExecute(); }}
+                disabled={session.isBusy}
+                className="bg-emerald-700 hover:bg-emerald-600 disabled:bg-zinc-700 text-white text-[10px] px-3 py-2"
+              >
+                批准并执行
+              </button>
+              <button
+                onClick={onFinishWithoutExecution}
+                disabled={session.isBusy}
+                className="bg-zinc-700 hover:bg-zinc-600 disabled:bg-zinc-700 text-white text-[10px] px-3 py-2"
+              >
+                仅保存并结束
+              </button>
+            </>
+          )}
         </div>
       </div>
     </div>
@@ -607,8 +1049,8 @@ const CliChatMode = ({
                   <span className="text-xs">🤖</span>
                 </div>
                 <div className="max-w-[70%] p-3 bg-zinc-800 border-2 border-zinc-700 rounded-r-lg rounded-bl-lg text-emerald-400">
-                  <div className="whitespace-pre-wrap break-words">
-                    {msg.content}
+                  <div className="break-words">
+                    <CliMarkdownContent content={msg.content} />
                     {msg.isStreaming && (
                       <span className="inline-block w-2 h-4 bg-emerald-400 ml-1 animate-pulse"></span>
                     )}
@@ -685,30 +1127,142 @@ export default function App() {
   const [activeTabAgentId, setActiveTabAgentId] = useState<string | null>(null);
   const [pendingAgentSelection, setPendingAgentSelection] = useState<Agent[] | null>(null);
 
+  // Agent 选择状态
+  const [selectedAgentForSingleMode, setSelectedAgentForSingleMode] = useState<string | null>(null);
+  const [executionMode, setExecutionMode] = useState<ExecutionMode>('multi');
+  const [brainstormSession, setBrainstormSession] = useState<BrainstormSessionState | null>(null);
+
+  // 错误提示状态
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [showErrorDialog, setShowErrorDialog] = useState(false);
+
   // Working Directory - 从 localStorage 加载保存的值
   const [workingDirectory, setWorkingDirectory] = useState(() => {
     const saved = localStorage.getItem('bytevalley-working-dir');
     return saved || 'D:\\work_data\\claude_workspace\\ByteValley'; // Windows 默认路径
   });
 
-  // 保存工作目录到 localStorage
+  const [showSettingsConfig, setShowSettingsConfig] = useState(false);
+  const [isTestingConnectivity, setIsTestingConnectivity] = useState(false);
+  const [connectivityTestResult, setConnectivityTestResult] = useState<SDKConnectivityTestResult | null>(null);
+  const [settingsDraft, setSettingsDraft] = useState(() => ({
+    apiKey: sdkConfig.apiKey,
+    baseURL: sdkConfig.baseURL,
+    model: sdkConfig.model,
+    timeout: String(sdkConfig.timeout),
+    maxTokens: String(sdkConfig.maxTokens),
+    maxSteps: String(sdkConfig.maxSteps),
+    workingDirectory: localStorage.getItem('bytevalley-working-dir') || 'D:\\work_data\\claude_workspace\\ByteValley',
+  }));
+
+  // 保存工作目录到 localStorage + SDK 运行时配置
   const saveWorkingDirectory = (dir: string) => {
-    localStorage.setItem('bytevalley-working-dir', dir);
-    setWorkingDirectory(dir);
-    // 同步到 SDK 配置
+    const nextDir = dir.trim();
+    if (!nextDir) return;
+    setWorkingDirectory(nextDir);
+    setSDKWorkingDirectory(nextDir);
+  };
+
+  const openSettingsConfig = () => {
+    setSettingsDraft({
+      apiKey: sdkConfig.apiKey,
+      baseURL: sdkConfig.baseURL,
+      model: sdkConfig.model,
+      timeout: String(sdkConfig.timeout),
+      maxTokens: String(sdkConfig.maxTokens),
+      maxSteps: String(sdkConfig.maxSteps),
+      workingDirectory,
+    });
+    setConnectivityTestResult(null);
+    setShowSettingsConfig(true);
+  };
+
+  const runSettingsConnectivityTest = async () => {
+    const baseURL = settingsDraft.baseURL.trim();
+    const model = settingsDraft.model.trim();
+    const apiKey = settingsDraft.apiKey.trim();
+    const timeoutRaw = Number(settingsDraft.timeout);
+    const timeout = Number.isFinite(timeoutRaw) ? timeoutRaw : sdkConfig.timeout;
+
+    setIsTestingConnectivity(true);
+    setConnectivityTestResult(null);
     try {
-      if (typeof window !== 'undefined' && (window as any).require) {
-        // Electron 环境 - 更新 SDK 配置
-        const { sdkConfig } = require('./agent/sdkConfig');
-        sdkConfig.workingDirectory = dir;
-      }
-    } catch (e) {
-      console.log('SDK config update deferred');
+      const result = await testSDKConnectivity({
+        apiKey,
+        baseURL,
+        model,
+        timeout,
+      });
+      setConnectivityTestResult(result);
+    } catch (error: any) {
+      setConnectivityTestResult({
+        success: false,
+        message: `连接失败：${error?.message || 'Unknown error'}`,
+        latencyMs: 0,
+        baseURL,
+        model,
+      });
+    } finally {
+      setIsTestingConnectivity(false);
     }
   };
 
+  const saveSettingsConfig = () => {
+    const baseURL = settingsDraft.baseURL.trim();
+    const model = settingsDraft.model.trim();
+    const workingDir = settingsDraft.workingDirectory.trim();
+    const timeout = Number(settingsDraft.timeout);
+    const maxTokens = Number(settingsDraft.maxTokens);
+    const maxSteps = Number(settingsDraft.maxSteps);
+
+    if (!baseURL) {
+      setErrorMessage('Base URL 不能为空');
+      setShowErrorDialog(true);
+      return;
+    }
+
+    if (!model) {
+      setErrorMessage('Model 不能为空');
+      setShowErrorDialog(true);
+      return;
+    }
+
+    if (!Number.isFinite(timeout) || timeout < 1000 || timeout > 600000) {
+      setErrorMessage('Timeout 请输入 1000~600000 之间的数字（毫秒）');
+      setShowErrorDialog(true);
+      return;
+    }
+
+    if (!Number.isFinite(maxTokens) || maxTokens < 256 || maxTokens > 128000) {
+      setErrorMessage('Max Tokens 请输入 256~128000 之间的数字');
+      setShowErrorDialog(true);
+      return;
+    }
+
+    if (!Number.isFinite(maxSteps) || maxSteps < 1 || maxSteps > 100) {
+      setErrorMessage('Max Steps 请输入 1~100 之间的数字');
+      setShowErrorDialog(true);
+      return;
+    }
+
+    updateSDKConfig({
+      apiKey: settingsDraft.apiKey.trim(),
+      baseURL,
+      model,
+      timeout,
+      maxTokens,
+      maxSteps,
+    });
+
+    if (workingDir) {
+      saveWorkingDirectory(workingDir);
+    }
+
+    setShowSettingsConfig(false);
+  };
+
   // 浏览目录（仅 Electron）
-  const browseDirectory = async () => {
+  const browseDirectory = async (onSelected?: (dir: string) => void) => {
     try {
       console.log('[browseDirectory] Attempting to open directory dialog...');
 
@@ -721,7 +1275,11 @@ export default function App() {
         const result = await ipcRenderer.invoke('select-directory');
 
         if (result) {
-          saveWorkingDirectory(result);
+          if (onSelected) {
+            onSelected(result);
+          } else {
+            saveWorkingDirectory(result);
+          }
         }
       } else {
         console.warn('[browseDirectory] Not in Electron environment, dialog unavailable');
@@ -730,7 +1288,6 @@ export default function App() {
       console.error('[browseDirectory] Failed:', e);
     }
   };
-const [showDirConfig, setShowDirConfig] = useState(false);
   
   // Task Management
   const [tasks, setTasks] = useState<Task[]>([
@@ -740,7 +1297,8 @@ const [showDirConfig, setShowDirConfig] = useState(false);
       description: 'Sync latest API changes',
       status: 'TODO',
       createdAt: Date.now(),
-      executionLog: []
+      executionLog: [],
+      executionMode: 'multi',
     },
   ]);
   const [newTaskTitle, setNewTaskTitle] = useState('');
@@ -753,6 +1311,15 @@ const [showDirConfig, setShowDirConfig] = useState(false);
   const emergencyEndTimeRef = useRef<number>(0);
   const trashRef = useRef<HTMLButtonElement | null>(null);
   const selectedAgentIdRef = useRef<string>('agent-1');
+  const subAgentLinksRef = useRef<SubAgentLink[]>([]);
+  const linkPulsesRef = useRef<LinkPulse[]>([]);
+  const pulseThrottleRef = useRef<Map<string, number>>(new Map());
+  const pendingAgentSyncRef = useRef(false);
+  const portalEffectsRef = useRef<PortalEffect[]>([]);
+  const absorbEffectsRef = useRef<AbsorbEffect[]>([]);
+  const orchestratorStepAgentMapRef = useRef<Map<string, string>>(new Map());
+  const brainstormSummonTimeoutRef = useRef<number | null>(null);
+  const brainstormSessionRef = useRef<BrainstormSessionState | null>(null);
 
   // Use ref for agent position to avoid re-renders in the animation loop
   const agentsRef = useRef<Agent[]>([{
@@ -768,7 +1335,9 @@ const [showDirConfig, setShowDirConfig] = useState(false);
     animationVariant: 0,
     color: '#b87333',
     message: 'Waiting for tasks...',
-    overrideTimeout: null
+    overrideTimeout: null,
+    lastMessage: '',
+    currentTool: undefined,
   }]);
   const [agentsData, setAgentsData] = useState<Agent[]>([...agentsRef.current]);
 
@@ -799,12 +1368,17 @@ const [showDirConfig, setShowDirConfig] = useState(false);
         await initializeGameSDK();
 
         // 为初始的默认机器人创建 SDK
-        const colors = ['#b87333', '#3b82f6', '#10b981', '#8b5cf6', '#ef4444', '#f59e0b', '#ec4899', '#06b6d4'];
         console.log('[App] Registering SDK for initial agents:', agentsRef.current.map(a => a.id));
 
         for (const agent of agentsRef.current) {
           try {
-            await addSDKAgent(agent, colors);
+            const registered = await addSDKAgent(agent, 'primary');
+            // 向后兼容：旧数据里的默认 agent 没有 primary 标记，导致不会走 Orchestrator
+            agent.agentType = agent.agentType || 'primary';
+            agent.isPrimaryAgent = agent.isPrimaryAgent !== false;
+            agent.isTemporary = false;
+            agent.color = agent.color || registered.color;
+            agent.message = agent.message || registered.message;
           } catch (error) {
             console.error(`[App] Failed to register SDK for agent ${agent.id}:`, error);
           }
@@ -819,37 +1393,67 @@ const [showDirConfig, setShowDirConfig] = useState(false);
 
         // 设置状态更新回调 - 当 SDK 触发状态变化时，更新游戏中的机器人
         setGameStateUpdateCallback((agentId: string, state: AgentState, message: string) => {
-        const targetAgent = agentsRef.current.find(a => a.id === agentId);
-        if (!targetAgent) return;
+          const targetAgent = agentsRef.current.find(a => a.id === agentId);
+          if (!targetAgent) return;
+          const isManualStateMessage = isManualStateChangeMessage(message);
+          const stateChanged = targetAgent.state !== state;
+          const messageChanged = !isManualStateMessage && targetAgent.message !== message;
+          if (!stateChanged && !messageChanged) return;
 
-        if (targetAgent.overrideTimeout) {
-          clearTimeout(targetAgent.overrideTimeout);
-          targetAgent.overrideTimeout = null;
-        }
+          if (targetAgent.overrideTimeout) {
+            clearTimeout(targetAgent.overrideTimeout);
+            targetAgent.overrideTimeout = null;
+          }
 
-        targetAgent.state = state;
-        targetAgent.message = message;
-        targetAgent.overrideMode = undefined;
+          if (stateChanged) {
+            targetAgent.state = state;
+          }
+          if (messageChanged) {
+            targetAgent.message = message;
+            targetAgent.lastMessage = message;
+          }
+          targetAgent.overrideMode = undefined;
 
-        const maxVariants = state === 'SUCCESS' ? 4 : 3;
-        targetAgent.animationVariant = Math.floor(Math.random() * maxVariants);
+          // 同步消息到聊天会话（仅当消息实际变化）
+          if (messageChanged) {
+            setChatSessions(prev => {
+              const newSessions = new Map<string, ChatSession>(prev);
+              const session = newSessions.get(agentId);
+              if (session && session.messages[session.messages.length - 1]?.content !== message) {
+                session.messages.push({
+                  id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+                  role: 'assistant',
+                  content: message,
+                  timestamp: Date.now(),
+                });
+              }
+              return newSessions;
+            });
+          }
 
-        assignZonePosition(targetAgent, state);
+          if (stateChanged) {
+            const maxVariants = (state === 'SUCCESS' || state === 'DONE') ? 4 : 3;
+            targetAgent.animationVariant = Math.floor(Math.random() * maxVariants);
+            assignZonePosition(targetAgent, state);
+          }
 
-        if (state === 'AWAITING_APPROVAL') {
-          setApprovalAgentId(targetAgent.id);
-        } else if (approvalAgentId === targetAgent.id && currentQuestion) {
-          // 状态从 AWAITING_APPROVAL 变为其他状态时，清理问题
-          setCurrentQuestion(null);
-          setApprovalAgentId(null);
-        }
+          if (state === 'AWAITING_APPROVAL') {
+            setApprovalAgentId(targetAgent.id);
+          } else if (approvalAgentId === targetAgent.id && currentQuestion) {
+            // 状态从 AWAITING_APPROVAL 变为其他状态时，清理问题
+            setCurrentQuestion(null);
+            setApprovalAgentId(null);
+          }
 
-        setAgentsData([...agentsRef.current]);
-      });
+          setAgentsData([...agentsRef.current]);
+        });
 
       // 设置用户问题回调
       setUserQuestionCallback(async (question) => {
         console.log('[App] User question received:', question);
+        const resolvedAgentId = agentsRef.current.some(a => a.id === question.agentId)
+          ? question.agentId
+          : (selectedAgentIdRef.current || agentsRef.current[0]?.id || question.agentId);
 
         // 检测是否是规划模式请求
         if (question.question.includes('请将以下任务分解为')) {
@@ -860,7 +1464,7 @@ const [showDirConfig, setShowDirConfig] = useState(false);
           return new Promise((resolve) => {
             setPendingPlan({
               id: question.id,
-              agentId: question.agentId,
+              agentId: resolvedAgentId,
               task,
               steps: [],  // 初始为空，等待 AI 生成
             });
@@ -876,7 +1480,7 @@ const [showDirConfig, setShowDirConfig] = useState(false);
           id: question.id,
           question: question.question,
           options: question.options,
-          agentId: question.agentId,
+          agentId: resolvedAgentId,
         };
         console.log('[App] Setting question state:', newQuestion);
         setPendingQuestions(prev => [...prev, newQuestion]);
@@ -885,7 +1489,7 @@ const [showDirConfig, setShowDirConfig] = useState(false);
         setCurrentQuestion(newQuestion);
 
         // 设置 approvalAgentId 以触发整合的对话框
-        setApprovalAgentId(question.agentId);
+        setApprovalAgentId(resolvedAgentId);
 
         // 返回 Promise，等待用户回答
         return new Promise((resolve) => {
@@ -914,6 +1518,76 @@ const [showDirConfig, setShowDirConfig] = useState(false);
       // SDK 清理逻辑
     };
   }, []);
+
+  useEffect(() => {
+    if (currentView !== 'ROUNDTABLE_CHAT') return;
+    if (!brainstormSession || brainstormSession.phase !== 'SUMMONING') return;
+
+    if (brainstormSummonTimeoutRef.current) {
+      clearTimeout(brainstormSummonTimeoutRef.current);
+      brainstormSummonTimeoutRef.current = null;
+    }
+    emergencyEndTimeRef.current = 0;
+
+    const roleTypes: AgentType[] = ['planner', 'reviewer', 'executor'];
+    const roleMessages = [
+      'Planner joined roundtable',
+      'Reviewer joined roundtable',
+      'Executor joined roundtable',
+    ];
+
+    brainstormSession.subAgentIds.forEach((id, idx) => {
+      const roleType = roleTypes[idx] || 'executor';
+      const color = AGENT_TYPE_CONFIG[roleType].color;
+      upsertSubAgentVisual({
+        id,
+        parentAgentId: brainstormSession.parentAgentId,
+        agentType: roleType,
+        isTemporary: true,
+        color,
+        message: roleMessages[idx] || 'Brainstorm sub-agent ready',
+      }, brainstormSession.parentAgentId);
+      updateSubAgentState(id, 'THINKING', roleMessages[idx] || 'Brainstorm sub-agent ready');
+      emitLinkPulse(
+        brainstormSession.parentAgentId,
+        id,
+        'parent_to_child',
+        idx === 0 ? 'rgba(250,204,21,0.95)' : idx === 1 ? 'rgba(168,85,247,0.95)' : 'rgba(34,197,94,0.95)'
+      );
+    });
+
+    setBrainstormSession(prev => {
+      if (!prev || prev.id !== brainstormSession.id) return prev;
+      return {
+        ...prev,
+        phase: 'CLARIFYING',
+        updatedAt: Date.now(),
+        messages: [
+          ...prev.messages,
+          {
+            id: `brain-start-${Date.now()}`,
+            role: 'system',
+            content: 'All participants are in position. Share your goals and constraints to begin.',
+            timestamp: Date.now(),
+          },
+        ],
+      };
+    });
+    publishBrainstormEvent('phase_changed', brainstormSession.id, { phase: 'CLARIFYING' });
+  }, [currentView, brainstormSession]);
+
+  useEffect(() => {
+    return () => {
+      if (brainstormSummonTimeoutRef.current) {
+        clearTimeout(brainstormSummonTimeoutRef.current);
+        brainstormSummonTimeoutRef.current = null;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    brainstormSessionRef.current = brainstormSession;
+  }, [brainstormSession]);
 
   const handleMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
     if (currentView !== 'MAIN') return;
@@ -951,18 +1625,7 @@ const [showDirConfig, setShowDirConfig] = useState(false);
     const btn = INTERACTABLES.EMERGENCY_BUTTON;
     const distToBtn = Math.sqrt(Math.pow(x - btn.x, 2) + Math.pow(y - btn.y, 2));
     if (distToBtn <= btn.radius) {
-      emergencyEndTimeRef.current = Number.MAX_SAFE_INTEGER; // Flash until arrival
-      
-      agentsRef.current.forEach(agent => {
-        triggerState('THINKING', "BRAINSTORMING MODE INITIATED!", agent.id);
-        agent.targetX = btn.x;
-        agent.targetY = btn.y + 35;
-        agent.overrideMode = 'moving_to_emergency';
-        if (agent.overrideTimeout) {
-          clearTimeout(agent.overrideTimeout);
-          agent.overrideTimeout = null;
-        }
-      });
+      void startBrainstormSession();
       return;
     }
 
@@ -1061,20 +1724,40 @@ const [showDirConfig, setShowDirConfig] = useState(false);
     }
   };
 
-  const addTask = () => {
+  const addTask = async () => {
     if (!newTaskTitle.trim()) return;
+
+    // 检查是否选择了主 Agent
+    if (!selectedAgentForSingleMode) {
+      setErrorMessage('请先选择一个主 Agent 执行任务');
+      setShowErrorDialog(true);
+      return;
+    }
+
+    // 创建新任务（已绑定选中的主 Agent）
+    const targetAgentId = selectedAgentForSingleMode;
     const newTask: Task = {
       id: Math.random().toString(36).substr(2, 9),
       title: newTaskTitle,
-      description: 'New assigned mission',
+      description: newTaskTitle,
       status: 'TODO',
       createdAt: Date.now(),
-      executionLog: []
+      source: 'MANUAL',
+      agentId: targetAgentId,
+      executionMode,
     };
-    setTasks([newTask, ...tasks]);
+
+    // 先落盘到任务列表，再立即进入执行流程（单次提交即可执行）
+    setTasks(prevTasks => [newTask, ...prevTasks]);
     setNewTaskTitle('');
+
+    // 同步做一次分配动画/状态提示
+    assignTaskToAgent(newTask.id, targetAgentId);
+
+    // 一次提交直接执行（不再需要再点一次 EXECUTE）
+    await executeTask(newTask);
   };
-  
+
   const handleUserSubmit = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && userInput.trim()) {
       // Simulate interaction
@@ -1093,12 +1776,12 @@ const [showDirConfig, setShowDirConfig] = useState(false);
   };
 
   const updateTaskSupplementaryInput = (id: string, input: string) => {
-    setTasks(tasks.map(t => t.id === id ? { ...t, supplementaryInput: input } : t));
+    setTasks(prevTasks => prevTasks.map(t => t.id === id ? { ...t, supplementaryInput: input } : t));
   };
 
   // 🤖 分配任务给机器人
   const assignTaskToAgent = (taskId: string, agentId: string | undefined) => {
-    setTasks(tasks.map(t => {
+    setTasks(prevTasks => prevTasks.map(t => {
       if (t.id === taskId) {
         const updated = { ...t, agentId };
         if (agentId) {
@@ -1115,6 +1798,704 @@ const [showDirConfig, setShowDirConfig] = useState(false);
       }
       return t;
     }));
+  };
+
+  const freezeAgent = (agent: Agent, durationMs: number) => {
+    const until = performance.now() + durationMs;
+    agent.freezeUntil = Math.max(agent.freezeUntil || 0, until);
+    agent.targetX = agent.x;
+    agent.targetY = agent.y;
+    if (agent.overrideMode && agent.overrideMode !== 'dragging') {
+      agent.overrideMode = 'waiting';
+    }
+  };
+
+  const triggerPrimaryGesture = (agentId: string | undefined, gestureType: 'spawn' | 'cleanup') => {
+    if (!agentId) return;
+    const agent = agentsRef.current.find(a => a.id === agentId);
+    if (!agent) return;
+    agent.gestureType = gestureType;
+    const duration = gestureType === 'cleanup' ? 1050 : 900;
+    agent.gestureUntil = performance.now() + duration;
+    freezeAgent(agent, duration);
+  };
+
+  const syncAgentsDataSoon = () => {
+    if (pendingAgentSyncRef.current) return;
+    pendingAgentSyncRef.current = true;
+    requestAnimationFrame(() => {
+      pendingAgentSyncRef.current = false;
+      setAgentsData([...agentsRef.current]);
+    });
+  };
+
+  const emitLinkPulse = (
+    parentId: string | undefined,
+    childId: string | undefined,
+    direction: 'parent_to_child' | 'child_to_parent',
+    color?: string,
+    options?: {
+      delayMs?: number;
+      skipThrottle?: boolean;
+    }
+  ) => {
+    if (!parentId || !childId) return;
+
+    const parent = agentsRef.current.find(a => a.id === parentId);
+    const child = agentsRef.current.find(a => a.id === childId);
+    if (!parent || !child) return;
+
+    const key = `${parentId}:${childId}:${direction}`;
+    const now = performance.now();
+    const lastAt = pulseThrottleRef.current.get(key) || 0;
+    const minInterval = direction === 'parent_to_child' ? 420 : 900;
+    if (!options?.skipThrottle && now - lastAt < minInterval) return;
+    if (!options?.skipThrottle) {
+      pulseThrottleRef.current.set(key, now);
+    }
+
+    const MAX_ACTIVE_PULSES = 14;
+    if (linkPulsesRef.current.length >= MAX_ACTIVE_PULSES) {
+      linkPulsesRef.current.splice(0, linkPulsesRef.current.length - MAX_ACTIVE_PULSES + 1);
+    }
+
+    linkPulsesRef.current.push({
+      id: `pulse-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      parentId,
+      childId,
+      direction,
+      createdAt: now + (options?.delayMs || 0),
+      duration: 1350,
+      color,
+    });
+  };
+
+  const addPortalEffect = (
+    type: 'black' | 'white',
+    parentId: string,
+    x: number,
+    y: number,
+    duration = 900
+  ) => {
+    portalEffectsRef.current.push({
+      id: `${type}-${parentId}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      type,
+      x,
+      y,
+      duration,
+      parentId,
+      createdAt: performance.now(),
+    });
+  };
+
+  const upsertSubAgentVisual = (payload: SubAgentVisualPayload | undefined, fallbackParentId?: string) => {
+    if (!payload?.id) return;
+
+    const parentId = payload.parentAgentId || fallbackParentId;
+    const parentAgent = parentId ? agentsRef.current.find(a => a.id === parentId) : undefined;
+    const existing = agentsRef.current.find(a => a.id === payload.id);
+    const agentType = payload.agentType || existing?.agentType || 'executor';
+    const typeConfig = AGENT_TYPE_CONFIG[agentType];
+
+    if (!existing) {
+      const spawnX = parentAgent?.x ?? payload.x ?? ZONES.ROUNDTABLE.x;
+      const spawnY = (parentAgent?.y ?? payload.y ?? ZONES.ROUNDTABLE.y) - 10;
+      const spread = 70 + Math.random() * 70;
+      const angle = Math.random() * Math.PI * 2;
+
+      const subAgent: Agent = {
+        id: payload.id,
+        x: spawnX,
+        y: spawnY,
+        targetX: spawnX + Math.cos(angle) * spread,
+        targetY: spawnY + Math.sin(angle) * spread * 0.6,
+        state: 'THINKING',
+        speed: 145 + Math.random() * 20,
+        frame: 0,
+        facing: Math.random() > 0.5 ? 'right' : 'left',
+        animationVariant: Math.floor(Math.random() * 3),
+        overrideMode: 'moving',
+        color: payload.color || typeConfig.color,
+        message: payload.message || `${typeConfig.icon} ${typeConfig.name} spawned`,
+        overrideTimeout: null,
+        agentType,
+        isPrimaryAgent: false,
+        isTemporary: true,
+        parentAgentId: parentId,
+        lastMessage: payload.message || `${typeConfig.icon} ${typeConfig.name} spawned`,
+      };
+
+      agentsRef.current.push(subAgent);
+
+      // Spawn 动画后按状态规则入区，确保子 Agent 与主 Agent 使用同一状态-区域规则。
+      subAgent.overrideTimeout = window.setTimeout(() => {
+        const latest = agentsRef.current.find(a => a.id === subAgent.id);
+        if (!latest) return;
+        if (absorbEffectsRef.current.some(effect => effect.agentId === latest.id)) return;
+        assignZonePosition(latest, latest.state);
+        latest.overrideMode = undefined;
+        latest.overrideTimeout = null;
+        syncAgentsDataSoon();
+      }, 520);
+
+      if (parentAgent) {
+        const hasLink = subAgentLinksRef.current.some(
+          link => link.parentId === parentAgent.id && link.childId === subAgent.id
+        );
+        if (!hasLink) {
+          subAgentLinksRef.current.push({
+            parentId: parentAgent.id,
+            childId: subAgent.id,
+            createdAt: Date.now(),
+          });
+        }
+        triggerPrimaryGesture(parentAgent.id, 'spawn');
+        addPortalEffect('black', parentAgent.id, parentAgent.x, parentAgent.y - 12);
+        emitLinkPulse(parentAgent.id, subAgent.id, 'parent_to_child', 'rgba(250,204,21,0.95)');
+      }
+    } else {
+      existing.agentType = agentType;
+      existing.parentAgentId = parentId || existing.parentAgentId;
+      existing.isTemporary = true;
+      existing.isPrimaryAgent = false;
+      if (payload.color) existing.color = payload.color;
+      if (payload.message) {
+        existing.message = payload.message;
+        existing.lastMessage = payload.message;
+      }
+    }
+
+    syncAgentsDataSoon();
+  };
+
+  const updateSubAgentState = (agentId: string | undefined, state: AgentState, message?: string, toolName?: string) => {
+    if (!agentId) return;
+    const agent = agentsRef.current.find(a => a.id === agentId);
+    if (!agent) return;
+
+    const prevState = agent.state;
+    const prevMessage = agent.message;
+    const prevTool = agent.currentTool;
+    let changed = false;
+
+    if (agent.overrideTimeout) {
+      clearTimeout(agent.overrideTimeout);
+      agent.overrideTimeout = null;
+    }
+
+    if (prevState !== state) {
+      agent.state = state;
+      changed = true;
+    }
+    if (message) {
+      if (prevMessage !== message) {
+        agent.message = message;
+        agent.lastMessage = message;
+        changed = true;
+      }
+    }
+    if (toolName) {
+      if (prevTool !== toolName) {
+        agent.currentTool = toolName;
+        changed = true;
+      }
+    }
+
+    if (prevState !== state && !absorbEffectsRef.current.some(effect => effect.agentId === agentId)) {
+      assignZonePosition(agent, state);
+    }
+
+    if (changed) {
+      syncAgentsDataSoon();
+    }
+  };
+
+  const startSubAgentCleanup = (parentAgentId: string | undefined, subAgentIds?: string[]) => {
+    if (!parentAgentId) return;
+
+    const parentAgent = agentsRef.current.find(a => a.id === parentAgentId);
+    if (!parentAgent) return;
+
+    const ids = (subAgentIds && subAgentIds.length > 0)
+      ? subAgentIds
+      : agentsRef.current
+          .filter(a => a.isTemporary && a.parentAgentId === parentAgentId)
+          .map(a => a.id);
+
+    triggerPrimaryGesture(parentAgentId, 'cleanup');
+    addPortalEffect('white', parentAgentId, parentAgent.x, parentAgent.y - 12, 1000);
+
+    ids.forEach(id => {
+      const child = agentsRef.current.find(a => a.id === id && a.isTemporary);
+      if (!child) return;
+      if (absorbEffectsRef.current.some(effect => effect.agentId === child.id)) return;
+      if (child.overrideTimeout) {
+        clearTimeout(child.overrideTimeout);
+        child.overrideTimeout = null;
+      }
+
+      child.state = 'DONE';
+      child.message = 'Returning to primary void...';
+      child.lastMessage = child.message;
+
+      absorbEffectsRef.current.push({
+        agentId: child.id,
+        parentId: parentAgentId,
+        startX: child.x,
+        startY: child.y,
+        startAt: performance.now(),
+        duration: 900,
+      });
+
+      subAgentLinksRef.current = subAgentLinksRef.current.map(link => (
+        link.childId === child.id ? { ...link, pulling: true } : link
+      ));
+      emitLinkPulse(parentAgentId, child.id, 'parent_to_child', 'rgba(248,250,252,0.95)');
+    });
+
+    syncAgentsDataSoon();
+  };
+
+  const publishBrainstormEvent = (
+    type: BrainstormEventType,
+    sessionId: string,
+    data?: Record<string, unknown>
+  ) => {
+    console.log('[Brainstorm Event]', {
+      type,
+      sessionId,
+      timestamp: Date.now(),
+      data,
+    });
+  };
+
+  const getDefaultPrimaryAgentId = () => {
+    if (selectedAgentForSingleMode && agentsRef.current.some(a => a.id === selectedAgentForSingleMode)) {
+      return selectedAgentForSingleMode;
+    }
+
+    const preferred = agentsRef.current.find(
+      a => a.agentType === 'primary' || (!a.isTemporary && a.isPrimaryAgent !== false)
+    );
+    return preferred?.id || agentsRef.current[0]?.id;
+  };
+
+  const setBrainstormPhase = (phase: BrainstormPhase, extras?: Partial<BrainstormSessionState>) => {
+    setBrainstormSession(prev => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        ...extras,
+        phase,
+        updatedAt: Date.now(),
+      };
+    });
+  };
+
+  const appendBrainstormMessage = (
+    role: 'user' | 'assistant' | 'system',
+    content: string,
+    agentId?: string
+  ) => {
+    setBrainstormSession(prev => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        updatedAt: Date.now(),
+        messages: [
+          ...prev.messages,
+          {
+            id: `brain-msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            role,
+            content,
+            agentId,
+            timestamp: Date.now(),
+          },
+        ],
+      };
+    });
+  };
+
+  const runBrainstormDiscussionRound = async (
+    session: BrainstormSessionState,
+    stage: BrainstormDiscussionStage,
+    transcript: string,
+    objective: string
+  ): Promise<{ discussionNotes: string; replies: Array<{ role: BrainstormRole; agentId: string; content: string }> }> => {
+    const replies: Array<{ role: BrainstormRole; agentId: string; content: string }> = [];
+
+    for (const role of BRAINSTORM_ROLE_ORDER) {
+      const meta = BRAINSTORM_ROLE_META[role];
+      const agentId = session.subAgentIds[meta.index];
+      if (!agentId) continue;
+
+      emitLinkPulse(session.parentAgentId, agentId, 'parent_to_child', meta.dispatchColor);
+      updateSubAgentState(agentId, meta.state, `${meta.roleName} is discussing ${stage}...`);
+
+      const priorRoundNotes = replies
+        .map(item => `### ${BRAINSTORM_ROLE_META[item.role].roleName} 观点\n${item.content}`)
+        .join('\n\n');
+
+      const prompt = buildRoleDiscussionPrompt(
+        role,
+        stage,
+        session.topic,
+        transcript,
+        objective,
+        priorRoundNotes
+      );
+
+      const content = await quickSDKQuery(session.parentAgentId, prompt);
+      appendBrainstormMessage('assistant', content, agentId);
+      replies.push({ role, agentId, content });
+
+      updateSubAgentState(agentId, 'DONE', `${meta.roleName} discussion complete`);
+      emitLinkPulse(session.parentAgentId, agentId, 'child_to_parent', meta.dispatchColor);
+    }
+
+    const discussionNotes = replies
+      .map(item => `### ${BRAINSTORM_ROLE_META[item.role].roleName} 观点\n${item.content}`)
+      .join('\n\n');
+
+    return { discussionNotes, replies };
+  };
+
+  const writeBrainstormArtifact = async (relativePath: string, content: string): Promise<string> => {
+    if (typeof window === 'undefined' || !(window as any).require) {
+      throw new Error('Artifact writing currently requires Electron environment');
+    }
+
+    const path = (window as any).require('path');
+    const fs = (window as any).require('fs');
+    const fullPath = path.join(workingDirectory, relativePath);
+    const dirPath = path.dirname(fullPath);
+
+    fs.mkdirSync(dirPath, { recursive: true });
+    fs.writeFileSync(fullPath, content, 'utf-8');
+
+    return fullPath;
+  };
+
+  const startBrainstormSession = async () => {
+    if (brainstormSession?.isBusy || brainstormSession?.phase === 'EXECUTING') {
+      return;
+    }
+
+    const primaryAgentId = getDefaultPrimaryAgentId();
+    if (!primaryAgentId) {
+      setErrorMessage('No available primary agent for brainstorming');
+      setShowErrorDialog(true);
+      return;
+    }
+
+    if (brainstormSession) {
+      startSubAgentCleanup(brainstormSession.parentAgentId, brainstormSession.subAgentIds);
+    }
+
+    const sessionId = `brainstorm-${Date.now()}`;
+    const subAgentIds = [
+      `${sessionId}-planner`,
+      `${sessionId}-reviewer`,
+      `${sessionId}-executor`,
+    ];
+
+    const seedTopic = newTaskTitle.trim() || tasks.find(t => t.status === 'TODO')?.title || 'New Brainstorm';
+
+    const session: BrainstormSessionState = {
+      id: sessionId,
+      parentAgentId: primaryAgentId,
+      subAgentIds,
+      topic: seedTopic,
+      phase: 'SUMMONING',
+      isBusy: false,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      messages: [
+        {
+          id: `${sessionId}-boot`,
+          role: 'system',
+          content: 'Roundtable summoned. Agents are gathering and preparing brainstorming protocol.',
+          timestamp: Date.now(),
+          agentId: primaryAgentId,
+        },
+      ],
+    };
+
+    setBrainstormSession(session);
+    publishBrainstormEvent('brainstorm_started', sessionId, {
+      parentAgentId: primaryAgentId,
+      participants: agentsRef.current.map(a => a.id),
+    });
+
+    emergencyEndTimeRef.current = Number.MAX_SAFE_INTEGER;
+
+    agentsRef.current.forEach(agent => {
+      if (agent.overrideTimeout) {
+        clearTimeout(agent.overrideTimeout);
+        agent.overrideTimeout = null;
+      }
+      triggerState('THINKING', 'BRAINSTORMING MODE INITIATED!', agent.id);
+      agent.overrideMode = 'moving_to_emergency';
+      assignZonePosition(agent, 'THINKING');
+    });
+    syncAgentsDataSoon();
+
+    if (brainstormSummonTimeoutRef.current) {
+      clearTimeout(brainstormSummonTimeoutRef.current);
+    }
+
+    brainstormSummonTimeoutRef.current = window.setTimeout(() => {
+      emergencyEndTimeRef.current = 0;
+      setCurrentView('ROUNDTABLE_CHAT');
+    }, 4200);
+  };
+
+  const runBrainstormClarification = async (userText: string) => {
+    const session = brainstormSession;
+    if (!session || session.isBusy || (session.phase !== 'CLARIFYING' && session.phase !== 'OPTIONS')) return;
+    const normalizedTopic = session.topic === 'New Brainstorm'
+      ? userText.slice(0, 80)
+      : session.topic;
+
+    const userMessage = {
+      id: `brain-user-${Date.now()}`,
+      role: 'user' as const,
+      content: userText,
+      timestamp: Date.now(),
+    };
+
+    setBrainstormSession(prev => {
+      if (!prev || prev.id !== session.id) return prev;
+      return {
+        ...prev,
+        topic: normalizedTopic || prev.topic,
+        isBusy: true,
+        updatedAt: Date.now(),
+        messages: [...prev.messages, userMessage],
+      };
+    });
+
+    try {
+      const transcript = transcriptFromMessages([...session.messages, userMessage]);
+      const objective = `围绕用户最新输入完成多 Agent 澄清讨论，明确目标、约束、成功标准。\n最新用户输入：${userText}`;
+      await runBrainstormDiscussionRound(
+        { ...session, topic: normalizedTopic || session.topic },
+        'clarification',
+        transcript,
+        objective
+      );
+      setBrainstormPhase('CLARIFYING', { isBusy: false, error: undefined });
+    } catch (error: any) {
+      session.subAgentIds.forEach(id => {
+        updateSubAgentState(id, 'ERROR', `Clarification failed: ${error.message}`);
+      });
+      appendBrainstormMessage('system', `❌ Clarification failed: ${error.message}`);
+      setBrainstormPhase('ERROR', { isBusy: false, error: error.message });
+    }
+  };
+
+  const generateBrainstormOptions = async () => {
+    const session = brainstormSession;
+    if (!session || session.isBusy || session.phase !== 'CLARIFYING') return;
+    const reviewerId = session.subAgentIds[1];
+
+    setBrainstormSession(prev => prev ? { ...prev, isBusy: true, updatedAt: Date.now() } : prev);
+    appendBrainstormMessage('system', 'Generating candidate options...');
+
+    try {
+      const transcript = transcriptFromMessages(session.messages);
+      const objective = '围绕候选方案展开讨论：Planner 提方案、Reviewer 提风险、Executor 提落地可行性。';
+      const { discussionNotes } = await runBrainstormDiscussionRound(session, 'options', transcript, objective);
+
+      if (reviewerId) {
+        emitLinkPulse(session.parentAgentId, reviewerId, 'parent_to_child', 'rgba(168,85,247,0.95)');
+        updateSubAgentState(reviewerId, 'REVIEWING', 'Reviewer is consolidating final options...');
+      }
+      const options = await quickSDKQuery(
+        session.parentAgentId,
+        buildOptionsPrompt(session.topic, `${transcript}\n\n${discussionNotes}`)
+      );
+      appendBrainstormMessage('assistant', options, reviewerId);
+      if (reviewerId) {
+        updateSubAgentState(reviewerId, 'DONE', 'Final options ready');
+        emitLinkPulse(session.parentAgentId, reviewerId, 'child_to_parent', 'rgba(168,85,247,0.95)');
+      }
+
+      setBrainstormPhase('OPTIONS', {
+        isBusy: false,
+        optionsSummary: options,
+        error: undefined,
+      });
+      publishBrainstormEvent('phase_changed', session.id, { phase: 'OPTIONS' });
+    } catch (error: any) {
+      session.subAgentIds.forEach(id => {
+        updateSubAgentState(id, 'ERROR', `Option generation failed: ${error.message}`);
+      });
+      appendBrainstormMessage('system', `❌ Option generation failed: ${error.message}`);
+      setBrainstormPhase('ERROR', { isBusy: false, error: error.message });
+    }
+  };
+
+  const generateBrainstormSpec = async () => {
+    const session = brainstormSession;
+    if (!session || session.isBusy || session.phase !== 'OPTIONS') return;
+    const plannerId = session.subAgentIds[0];
+
+    setBrainstormPhase('DESIGNING', { isBusy: true, error: undefined });
+    appendBrainstormMessage('system', 'Drafting design spec...');
+
+    try {
+      const transcript = transcriptFromMessages(session.messages);
+      const objective = `围绕 Spec 展开讨论并补齐决策细节。\n候选方案摘要：${session.optionsSummary || '(none)'}`;
+      const { discussionNotes } = await runBrainstormDiscussionRound(session, 'spec', transcript, objective);
+
+      emitLinkPulse(session.parentAgentId, plannerId, 'parent_to_child', 'rgba(250,204,21,0.95)');
+      updateSubAgentState(plannerId, 'PLANNING', 'Planner is producing final spec...');
+      const spec = await quickSDKQuery(
+        session.parentAgentId,
+        buildSpecPrompt(session.topic, `${transcript}\n\n${discussionNotes}`, session.optionsSummary || '')
+      );
+      updateSubAgentState(plannerId, 'DONE', 'Spec draft completed');
+      emitLinkPulse(session.parentAgentId, plannerId, 'child_to_parent', 'rgba(250,204,21,0.95)');
+      appendBrainstormMessage('assistant', spec, plannerId);
+
+      const { specRelativePath } = buildArtifactPaths(workingDirectory, session.topic);
+      const specPath = await writeBrainstormArtifact(specRelativePath, spec);
+      appendBrainstormMessage('system', `Spec generated and saved:\n${specPath}`);
+      setBrainstormPhase('SPEC_READY', {
+        isBusy: false,
+        specContent: spec,
+        specPath,
+        error: undefined,
+      });
+      publishBrainstormEvent('artifact_ready', session.id, { type: 'spec', path: specPath });
+    } catch (error: any) {
+      session.subAgentIds.forEach(id => {
+        updateSubAgentState(id, 'ERROR', `Spec generation failed: ${error.message}`);
+      });
+      appendBrainstormMessage('system', `❌ Spec generation failed: ${error.message}`);
+      setBrainstormPhase('ERROR', { isBusy: false, error: error.message });
+    }
+  };
+
+  const generateBrainstormPlan = async () => {
+    const session = brainstormSession;
+    if (!session || session.isBusy || (session.phase !== 'SPEC_READY' && session.phase !== 'PLAN_READY')) return;
+    if (!session.specContent) {
+      appendBrainstormMessage('system', 'Spec is missing. Generate spec before plan.');
+      return;
+    }
+    const executorId = session.subAgentIds[2];
+
+    setBrainstormPhase('DESIGNING', { isBusy: true, error: undefined });
+    appendBrainstormMessage('system', 'Drafting implementation plan...');
+
+    try {
+      const transcript = transcriptFromMessages(session.messages);
+      const objective = `围绕 implementation plan 展开讨论，确保步骤可执行、可验证。\nSpec 摘要：${session.specContent.slice(0, 4000)}`;
+      const { discussionNotes } = await runBrainstormDiscussionRound(session, 'plan', transcript, objective);
+
+      emitLinkPulse(session.parentAgentId, executorId, 'parent_to_child', 'rgba(34,197,94,0.95)');
+      updateSubAgentState(executorId, 'EXECUTING', 'Executor is producing final implementation plan...');
+
+      const plan = await quickSDKQuery(
+        session.parentAgentId,
+        buildPlanPrompt(
+          session.topic,
+          `${session.specContent}\n\n## Multi-Agent Discussion Notes\n${discussionNotes}`
+        )
+      );
+
+      updateSubAgentState(executorId, 'DONE', 'Plan drafting complete');
+      emitLinkPulse(session.parentAgentId, executorId, 'child_to_parent', 'rgba(34,197,94,0.95)');
+      appendBrainstormMessage('assistant', plan, executorId);
+
+      const { planRelativePath } = buildArtifactPaths(workingDirectory, session.topic);
+      const planPath = await writeBrainstormArtifact(planRelativePath, plan);
+      appendBrainstormMessage('system', `Plan generated and saved:\n${planPath}`);
+      setBrainstormPhase('APPROVAL_PENDING', {
+        isBusy: false,
+        planContent: plan,
+        planPath,
+        error: undefined,
+      });
+      publishBrainstormEvent('artifact_ready', session.id, { type: 'plan', path: planPath });
+      publishBrainstormEvent('approval_required', session.id, { planPath });
+    } catch (error: any) {
+      session.subAgentIds.forEach(id => {
+        updateSubAgentState(id, 'ERROR', `Plan generation failed: ${error.message}`);
+      });
+      appendBrainstormMessage('system', `❌ Plan generation failed: ${error.message}`);
+      setBrainstormPhase('ERROR', { isBusy: false, error: error.message });
+    }
+  };
+
+  const approveBrainstormAndExecute = async () => {
+    const session = brainstormSession;
+    if (!session || session.isBusy || session.phase !== 'APPROVAL_PENDING') return;
+    if (!session.planContent || !session.planPath) {
+      appendBrainstormMessage('system', 'Plan artifact not ready. Please generate plan first.');
+      return;
+    }
+
+    setBrainstormPhase('EXECUTING', { isBusy: true, error: undefined });
+    appendBrainstormMessage('system', 'Plan approved. Dispatching orchestrated execution...');
+
+    // Brainstorm visuals should be cleaned before execution to reduce scene noise.
+    startSubAgentCleanup(session.parentAgentId, session.subAgentIds);
+    emergencyEndTimeRef.current = 0;
+    setCurrentView('MAIN');
+
+    const executionTask: Task = {
+      id: `brain-task-${Date.now()}`,
+      title: `[Brainstorm] ${session.topic}`,
+      description: session.topic,
+      status: 'TODO',
+      createdAt: Date.now(),
+      source: 'BRAINSTORM',
+      agentId: session.parentAgentId,
+      executionMode: 'multi',
+      supplementaryInput: `Spec: ${session.specPath || 'N/A'}\nPlan: ${session.planPath}\n\nPlan Content:\n${session.planContent}`,
+      executionLog: [
+        `[${new Date().toLocaleTimeString()}] Brainstorm approved by user`,
+        `[Spec] ${session.specPath || 'N/A'}`,
+        `[Plan] ${session.planPath}`,
+      ],
+    };
+
+    setTasks(prev => [executionTask, ...prev]);
+
+    try {
+      await executeTask(executionTask);
+      setBrainstormPhase('FINISHED', { isBusy: false });
+      appendBrainstormMessage('system', '✅ Brainstorm task execution finished.');
+      publishBrainstormEvent('brainstorm_completed', session.id, { executionTaskId: executionTask.id });
+    } catch (error: any) {
+      appendBrainstormMessage('system', `❌ Brainstorm execution failed: ${error.message}`);
+      setBrainstormPhase('ERROR', { isBusy: false, error: error.message });
+    }
+  };
+
+  const finishBrainstormWithoutExecution = () => {
+    const session = brainstormSession;
+    if (!session || session.isBusy) return;
+    appendBrainstormMessage('system', 'Session finished. Artifacts saved without execution.');
+    setBrainstormPhase('FINISHED', { isBusy: false });
+    startSubAgentCleanup(session.parentAgentId, session.subAgentIds);
+    emergencyEndTimeRef.current = 0;
+    setCurrentView('MAIN');
+    publishBrainstormEvent('brainstorm_completed', session.id, { executed: false });
+  };
+
+  const closeRoundtable = () => {
+    if (brainstormSession?.phase === 'EXECUTING' || brainstormSession?.isBusy) return;
+    if (brainstormSession && brainstormSession.phase !== 'FINISHED') {
+      finishBrainstormWithoutExecution();
+      return;
+    }
+    emergencyEndTimeRef.current = 0;
+    setCurrentView('MAIN');
+    triggerState('IDLE', 'Brainstorming session ended.');
   };
 
   // 🤖 执行任务
@@ -1167,17 +2548,322 @@ const [showDirConfig, setShowDirConfig] = useState(false);
     });
 
     // 更新任务状态
-    setTasks(tasks.map(t => {
+    setTasks(prevTasks => prevTasks.map(t => {
       if (t.id === task.id) {
         return {
           ...t,
           status: 'IN_PROGRESS' as TaskStatus,
-          executionLog: [`[${new Date().toLocaleTimeString()}] Mission started...`]
+          executionLog: [
+            `[${new Date().toLocaleTimeString()}] Mission started...`,
+            `[${new Date().toLocaleTimeString()}] Mode: ${(task.executionMode || 'multi').toUpperCase()}`,
+          ]
         };
       }
       return t;
     }));
 
+    // ========== 执行模式路由 ==========
+    // 向后兼容：旧 agent 可能缺失 isPrimaryAgent 字段（undefined）
+    const isPrimaryAgent = agent.agentType === 'primary' || agent.isPrimaryAgent !== false;
+    const requestedMode: ExecutionMode = task.executionMode || 'multi';
+    const shouldUseMultiAgent = isPrimaryAgent && requestedMode === 'multi';
+
+    if (shouldUseMultiAgent) {
+      console.log('[executeTask] Using Orchestrator for primary agent:', agent.id);
+
+      try {
+        const { orchestrateTask } = await import('./agent/Orchestrator');
+
+        // 添加 Orchestrator 进度消息
+        const addOrchestratorMessage = (content: string) => {
+          setChatSessions(prev => {
+            const newMap = new Map(prev);
+            const session = newMap.get(task.agentId!) as ChatSession | undefined;
+            if (session) {
+              const msg: ChatMessage = {
+                id: `msg_${Date.now()}_orch_${Math.random().toString(36).substr(2, 5)}`,
+                role: 'system',
+                content,
+                timestamp: Date.now(),
+                messageType: 'status',
+              };
+              newMap.set(task.agentId!, {
+                ...session,
+                messages: [...session.messages, msg],
+                lastActive: Date.now(),
+              });
+            }
+            return newMap;
+          });
+        };
+        const resolveParentId = (data: any) => data?.parentAgentId || task.agentId;
+        const resolveChildId = (data: any) => (
+          data?.agentId || (data?.stepId ? orchestratorStepAgentMapRef.current.get(data.stepId) : undefined)
+        );
+        const pulseParentToChild = (data: any, color?: string, burst = false) => {
+          const parentId = resolveParentId(data);
+          const childId = resolveChildId(data);
+          emitLinkPulse(parentId, childId, 'parent_to_child', color);
+          if (burst) {
+            emitLinkPulse(parentId, childId, 'parent_to_child', color, {
+              delayMs: 380,
+              skipThrottle: true,
+            });
+          }
+        };
+        const pulseChildToParent = (data: any, color?: string) => {
+          emitLinkPulse(resolveParentId(data), resolveChildId(data), 'child_to_parent', color);
+        };
+
+        triggerState('THINKING', '👑 Orchestrator: Starting multi-agent coordination...', task.agentId);
+        addOrchestratorMessage('👑 **Orchestrator Started**\nCoordinating sub-agents: Planner → Executor → Tester → Reviewer');
+        orchestratorStepAgentMapRef.current.clear();
+
+        const result = await orchestrateTask(agent, {
+          id: task.id,
+          title: task.title,
+          description: task.description,
+          status: task.status as 'TODO' | 'IN_PROGRESS' | 'COMPLETED' | 'FAILED' | 'PENDING',
+          createdAt: task.createdAt,
+          source: task.source || 'MANUAL',
+          agentId: task.agentId,
+          workingDirectory,
+        }, {
+          maxRetries: 3,
+          onProgress: (step, data) => {
+            // Keep noisy progress logs disabled to reduce main-thread overhead in dev mode.
+            switch (step) {
+              case 'creating_planner':
+                addOrchestratorMessage('📋 **Creating Planner Agent**...\nAnalyzing task structure...');
+                triggerState('PLANNING', 'Planner is preparing a DAG plan...', task.agentId);
+                break;
+              case 'planner_created':
+                addOrchestratorMessage(`✓ Planner Agent created: ${data.agentId?.slice(-6)}`);
+                if (data.stepId && data.agentId) {
+                  orchestratorStepAgentMapRef.current.set(data.stepId, data.agentId);
+                }
+                upsertSubAgentVisual(data.subAgent, data.parentAgentId || task.agentId);
+                updateSubAgentState(data.agentId, 'PLANNING', 'Planner activated');
+                pulseParentToChild(data, 'rgba(250,204,21,0.95)', true);
+                break;
+              case 'running_planner':
+                addOrchestratorMessage('📋 **Planner working**...\nBreaking down task into steps...');
+                triggerState('PLANNING', 'Planner is generating DAG steps...', task.agentId);
+                updateSubAgentState(data.agentId, 'PLANNING', 'Planner is generating DAG steps...');
+                pulseParentToChild(data, 'rgba(250,204,21,0.95)');
+                break;
+              case 'planner_completed':
+                addOrchestratorMessage(`✓ **Plan created**\n\`\`\`${data.result?.slice(0, 100)}...\`\`\``);
+                updateSubAgentState(data.agentId, 'DONE', 'Planner completed');
+                pulseChildToParent(data, 'rgba(250,204,21,0.95)');
+                break;
+              case 'creating_executor':
+                addOrchestratorMessage('⚙️ **Creating Executor Agent**...\nPreparing to implement...');
+                break;
+              case 'executor_created':
+                addOrchestratorMessage(`✓ Executor Agent created: ${data.agentId?.slice(-6)}`);
+                if (data.stepId && data.agentId) {
+                  orchestratorStepAgentMapRef.current.set(data.stepId, data.agentId);
+                }
+                upsertSubAgentVisual(data.subAgent, data.parentAgentId || task.agentId);
+                updateSubAgentState(data.agentId, 'THINKING', 'Executor ready');
+                pulseParentToChild(data, 'rgba(34,197,94,0.95)', true);
+                break;
+              case 'running_executor':
+                addOrchestratorMessage('⚙️ **Executor working**...\nImplementing code changes...');
+                triggerState('EXECUTING', 'Executor is applying code changes...', task.agentId);
+                updateSubAgentState(
+                  data.agentId || orchestratorStepAgentMapRef.current.get(data.stepId),
+                  'EXECUTING',
+                  'Executor is applying code changes...'
+                );
+                pulseParentToChild(data, 'rgba(34,197,94,0.95)');
+                break;
+              case 'executor_completed':
+                addOrchestratorMessage(`✓ **Execution completed**\n\`\`\`${data.result?.slice(0, 100)}...\`\`\``);
+                updateSubAgentState(
+                  data.agentId || orchestratorStepAgentMapRef.current.get(data.stepId),
+                  'DONE',
+                  'Executor completed'
+                );
+                pulseChildToParent(data, 'rgba(34,197,94,0.95)');
+                break;
+              case 'creating_tester':
+                addOrchestratorMessage('🔍 **Creating Tester Agent**...\nPreparing to validate...');
+                break;
+              case 'tester_created':
+                addOrchestratorMessage(`✓ Tester Agent created: ${data.agentId?.slice(-6)}`);
+                if (data.stepId && data.agentId) {
+                  orchestratorStepAgentMapRef.current.set(data.stepId, data.agentId);
+                }
+                upsertSubAgentVisual(data.subAgent, data.parentAgentId || task.agentId);
+                updateSubAgentState(data.agentId, 'THINKING', 'Tester ready');
+                pulseParentToChild(data, 'rgba(239,68,68,0.95)', true);
+                break;
+              case 'running_tester':
+                addOrchestratorMessage('🔍 **Tester working**...\nRunning tests and validation...');
+                triggerState('TESTING', 'Tester is validating implementation...', task.agentId);
+                updateSubAgentState(
+                  data.agentId || orchestratorStepAgentMapRef.current.get(data.stepId),
+                  'TESTING',
+                  'Tester is validating implementation...'
+                );
+                pulseParentToChild(data, 'rgba(239,68,68,0.95)');
+                break;
+              case 'tester_completed':
+                addOrchestratorMessage(`✓ **Testing completed**\n\`\`\`${data.result?.slice(0, 100)}...\`\`\``);
+                updateSubAgentState(
+                  data.agentId || orchestratorStepAgentMapRef.current.get(data.stepId),
+                  'DONE',
+                  'Tester completed'
+                );
+                pulseChildToParent(data, 'rgba(239,68,68,0.95)');
+                break;
+              case 'creating_reviewer':
+                addOrchestratorMessage('✓ **Creating Reviewer Agent**...\nPreparing to review...');
+                break;
+              case 'reviewer_created':
+                addOrchestratorMessage(`✓ Reviewer Agent created: ${data.agentId?.slice(-6)}`);
+                if (data.stepId && data.agentId) {
+                  orchestratorStepAgentMapRef.current.set(data.stepId, data.agentId);
+                }
+                upsertSubAgentVisual(data.subAgent, data.parentAgentId || task.agentId);
+                updateSubAgentState(data.agentId, 'THINKING', 'Reviewer ready');
+                pulseParentToChild(data, 'rgba(168,85,247,0.95)', true);
+                break;
+              case 'running_reviewer':
+                addOrchestratorMessage('✓ **Reviewer working**...\nChecking code quality...');
+                triggerState('REVIEWING', 'Reviewer is checking quality and risks...', task.agentId);
+                updateSubAgentState(
+                  data.agentId || orchestratorStepAgentMapRef.current.get(data.stepId),
+                  'REVIEWING',
+                  'Reviewer is checking quality and risks...'
+                );
+                pulseParentToChild(data, 'rgba(168,85,247,0.95)');
+                break;
+              case 'reviewer_completed':
+                addOrchestratorMessage(`✓ **Review completed**\n\`\`\`${data.result?.slice(0, 100)}...\`\`\``);
+                updateSubAgentState(
+                  data.agentId || orchestratorStepAgentMapRef.current.get(data.stepId),
+                  'DONE',
+                  'Reviewer completed'
+                );
+                pulseChildToParent(data, 'rgba(168,85,247,0.95)');
+                break;
+              case 'subagent_state':
+                updateSubAgentState(
+                  data.agentId,
+                  (data.state as AgentState) || 'THINKING',
+                  data.message,
+                  data.toolName
+                );
+                // Avoid per-state pulse spam; only surface critical callbacks.
+                if (data.state === 'ERROR') {
+                  pulseChildToParent(data, 'rgba(248,113,113,0.95)');
+                }
+                break;
+              case 'cleanup':
+                addOrchestratorMessage(`🧹 **Cleaning up** ${data.subAgentCount} sub-agents...`);
+                startSubAgentCleanup(data.parentAgentId || task.agentId, data.subAgentIds);
+                if (Array.isArray(data.subAgentIds)) {
+                  data.subAgentIds.forEach((subId: string) => {
+                    emitLinkPulse(data.parentAgentId || task.agentId, subId, 'parent_to_child', 'rgba(248,250,252,0.95)');
+                    emitLinkPulse(
+                      data.parentAgentId || task.agentId,
+                      subId,
+                      'parent_to_child',
+                      'rgba(248,250,252,0.95)',
+                      { delayMs: 380, skipThrottle: true }
+                    );
+                  });
+                }
+                break;
+              case 'cleanup_done':
+                orchestratorStepAgentMapRef.current.clear();
+                break;
+              case 'completed':
+                addOrchestratorMessage(`✓ **Orchestration Complete**\n\n**Result:**\n${data.result?.finalResult?.slice(0, 200)}...`);
+                triggerState('DONE', 'Orchestration finished. Finalizing...', task.agentId);
+                break;
+            }
+          }
+        });
+
+        // 任务完成
+        setTasks(prevTasks => prevTasks.map(t => {
+          if (t.id === task.id) {
+            return {
+              ...t,
+              status: result.success ? 'COMPLETED' as TaskStatus : 'FAILED' as TaskStatus,
+              result: result.finalResult,
+              source: 'ORCHESTRATED',
+              executionLog: [
+                ...(t.executionLog || []),
+                `[${new Date().toLocaleTimeString()}] ✓ Orchestrator completed!`,
+                `[Plan] ${result.plan?.slice(0, 50) || 'N/A'}`,
+                `[Execution] ${result.execution?.slice(0, 50) || 'N/A'}`,
+                `[Test] ${result.test?.slice(0, 50) || 'N/A'}`,
+                `[Review] ${result.review?.slice(0, 50) || 'N/A'}`,
+              ]
+            };
+          }
+          return t;
+        }));
+
+        // 机器人进入成功状态
+        triggerState(result.success ? 'SUCCESS' : 'ERROR',
+          result.success ? '✓ Multi-agent task completed!' : '✗ Task failed',
+          task.agentId);
+
+        // 添加最终结果消息到 chat session
+        const finalMsg: ChatMessage = {
+          id: `msg_${Date.now()}_final`,
+          role: 'assistant',
+          content: result.finalResult || 'Task completed',
+          timestamp: Date.now(),
+          isComplete: true,
+        };
+        setChatSessions(prev => {
+          const newMap = new Map(prev);
+          const session = newMap.get(task.agentId!) as ChatSession | undefined;
+          if (session) {
+            newMap.set(task.agentId!, {
+              ...session,
+              messages: [...session.messages, finalMsg],
+              isProcessing: false,
+              lastActive: Date.now(),
+            });
+          }
+          return newMap;
+        });
+
+        return;
+
+      } catch (error: any) {
+        console.error('[executeTask] Orchestrator failed:', error);
+
+        // 错误处理
+        setTasks(prevTasks => prevTasks.map(t => {
+          if (t.id === task.id) {
+            return {
+              ...t,
+              status: 'FAILED' as TaskStatus,
+              error: error.message,
+              executionLog: [
+                ...(t.executionLog || []),
+                `[${new Date().toLocaleTimeString()}] ✗ Orchestrator failed: ${error.message}`
+              ]
+            };
+          }
+          return t;
+        }));
+
+        triggerState('ERROR', `Orchestrator failed: ${error.message}`, task.agentId);
+        return;
+      }
+    }
+
+    // ========== 单 Agent 模式（或非 Primary Agent）==========
     try {
       // 构建 SDK 提示词
       const prompt = task.supplementaryInput
@@ -1281,6 +2967,7 @@ const [showDirConfig, setShowDirConfig] = useState(false);
 
       // 追踪当前工具消息 ID，用于更新而非创建新消息
       let currentToolMessageId: string | undefined;
+      let currentToolFiles: string[] = [];
 
       const result = await executeSDKTaskStream(
         task.agentId,
@@ -1294,13 +2981,24 @@ const [showDirConfig, setShowDirConfig] = useState(false);
               updateStreamMessage(assistantContent);
               break;
             case 'tool_use':
+              const toolName = chunk.data.toolName as string;
+              const displayName = TOOL_DISPLAY_NAMES[toolName] || toolName;
+              const writeTool = isWriteTool(toolName);
+              currentToolFiles = writeTool ? extractWriteFiles(toolName, chunk.data.input) : [];
+              const useMessage = writeTool
+                ? `🔧 正在写入文件: ${formatChangedFiles(currentToolFiles)}`
+                : `🔧 正在${displayName}...`;
+              const toolInputSummary = writeTool
+                ? { files: currentToolFiles }
+                : chunk.data.input;
+
               // 第一次创建工具消息，后续更新同一消息
               if (!currentToolMessageId) {
                 addSystemMessage(
-                  `🔧 正在${TOOL_DISPLAY_NAMES[chunk.data.toolName] || chunk.data.toolName}...`,
+                  useMessage,
                   'tool_use',
-                  chunk.data.toolName,
-                  chunk.data.input,
+                  toolName,
+                  toolInputSummary,
                   chunk.data.status
                 );
                 // 获取刚创建的消息 ID
@@ -1317,43 +3015,54 @@ const [showDirConfig, setShowDirConfig] = useState(false);
               } else {
                 // 更新现有消息
                 addSystemMessage(
-                  `🔧 正在${TOOL_DISPLAY_NAMES[chunk.data.toolName] || chunk.data.toolName}...`,
+                  useMessage,
                   'tool_use',
-                  chunk.data.toolName,
-                  chunk.data.input,
+                  toolName,
+                  toolInputSummary,
                   chunk.data.status,
                   currentToolMessageId
                 );
               }
-              triggerState(chunk.data.targetState as AgentState, `Using tool: ${chunk.data.toolName}`, task.agentId);
+              triggerState(chunk.data.targetState as AgentState, `Using tool: ${toolName}`, task.agentId);
               break;
             case 'tool_result':
               const success = chunk.data.success;
-              const displayName = TOOL_DISPLAY_NAMES[chunk.data.toolName] || chunk.data.toolName;
+              const resultToolName = chunk.data.toolName as string;
+              const resultDisplayName = TOOL_DISPLAY_NAMES[resultToolName] || resultToolName;
+              const writeResultTool = isWriteTool(resultToolName);
+              const resultFiles = writeResultTool
+                ? (currentToolFiles.length > 0
+                  ? currentToolFiles
+                  : extractWriteFiles(resultToolName, undefined, chunk.data.result))
+                : [];
+              const resultMessage = writeResultTool
+                ? (success
+                  ? `✅ 已修改文件: ${formatChangedFiles(resultFiles)}`
+                  : `❌ 文件修改失败: ${formatChangedFiles(resultFiles)}`)
+                : (success
+                  ? `✅ ${resultDisplayName}完成`
+                  : `❌ ${resultDisplayName}失败`);
               // 更新现有工具消息为完成状态
               if (currentToolMessageId) {
                 addSystemMessage(
-                  success
-                    ? `✅ ${displayName}完成`
-                    : `❌ ${displayName}失败`,
+                  resultMessage,
                   'tool_result',
-                  chunk.data.toolName,
+                  resultToolName,
                   undefined,
                   success ? 'done' : 'failed',
                   currentToolMessageId
                 );
               } else {
                 addSystemMessage(
-                  success
-                    ? `✅ ${displayName}完成`
-                    : `❌ ${displayName}失败`,
+                  resultMessage,
                   'tool_result',
-                  chunk.data.toolName,
+                  resultToolName,
                   undefined,
                   success ? 'done' : 'failed'
                 );
               }
               currentToolMessageId = undefined;  // 重置
+              currentToolFiles = [];
               break;
             case 'state_change':
               if (chunk.data.state !== 'IDLE' && chunk.data.state !== 'SUCCESS') {
@@ -1377,7 +3086,7 @@ const [showDirConfig, setShowDirConfig] = useState(false);
       }
 
       // 任务完成
-      setTasks(tasks.map(t => {
+      setTasks(prevTasks => prevTasks.map(t => {
         if (t.id === task.id) {
           return {
             ...t,
@@ -1427,7 +3136,7 @@ const [showDirConfig, setShowDirConfig] = useState(false);
       });
 
       // 任务失败
-      setTasks(tasks.map(t => {
+      setTasks(prevTasks => prevTasks.map(t => {
         if (t.id === task.id) {
           return {
             ...t,
@@ -1644,6 +3353,7 @@ const [showDirConfig, setShowDirConfig] = useState(false);
 
       // 追踪当前工具消息 ID，用于更新而非创建新消息
       let currentToolMessageId: string | undefined;
+      let currentToolFiles: string[] = [];
 
       const result = await executeSDKTaskStream(
         activeTabAgentId,
@@ -1658,13 +3368,24 @@ const [showDirConfig, setShowDirConfig] = useState(false);
               updateStreamMessage(assistantContent);
               break;
             case 'tool_use':
+              const toolName = chunk.data.toolName as string;
+              const displayName = TOOL_DISPLAY_NAMES[toolName] || toolName;
+              const writeTool = isWriteTool(toolName);
+              currentToolFiles = writeTool ? extractWriteFiles(toolName, chunk.data.input) : [];
+              const useMessage = writeTool
+                ? `🔧 正在写入文件: ${formatChangedFiles(currentToolFiles)}`
+                : `🔧 正在${displayName}...`;
+              const toolInputSummary = writeTool
+                ? { files: currentToolFiles }
+                : chunk.data.input;
+
               // 第一次创建工具消息，后续更新同一消息
               if (!currentToolMessageId) {
                 addSystemMessage(
-                  `🔧 正在${TOOL_DISPLAY_NAMES[chunk.data.toolName] || chunk.data.toolName}...`,
+                  useMessage,
                   'tool_use',
-                  chunk.data.toolName,
-                  chunk.data.input,
+                  toolName,
+                  toolInputSummary,
                   chunk.data.status
                 );
                 // 获取刚创建的消息 ID
@@ -1681,44 +3402,55 @@ const [showDirConfig, setShowDirConfig] = useState(false);
               } else {
                 // 更新现有消息
                 addSystemMessage(
-                  `🔧 正在${TOOL_DISPLAY_NAMES[chunk.data.toolName] || chunk.data.toolName}...`,
+                  useMessage,
                   'tool_use',
-                  chunk.data.toolName,
-                  chunk.data.input,
+                  toolName,
+                  toolInputSummary,
                   chunk.data.status,
                   currentToolMessageId
                 );
               }
               // 更新机器人状态
-              triggerState(chunk.data.targetState as AgentState, `Using tool: ${chunk.data.toolName}`, activeTabAgentId);
+              triggerState(chunk.data.targetState as AgentState, `Using tool: ${toolName}`, activeTabAgentId);
               break;
             case 'tool_result':
               // 更新现有工具消息为完成状态
               const success = chunk.data.success;
-              const displayName = TOOL_DISPLAY_NAMES[chunk.data.toolName] || chunk.data.toolName;
+              const resultToolName = chunk.data.toolName as string;
+              const resultDisplayName = TOOL_DISPLAY_NAMES[resultToolName] || resultToolName;
+              const writeResultTool = isWriteTool(resultToolName);
+              const resultFiles = writeResultTool
+                ? (currentToolFiles.length > 0
+                  ? currentToolFiles
+                  : extractWriteFiles(resultToolName, undefined, chunk.data.result))
+                : [];
+              const resultMessage = writeResultTool
+                ? (success
+                  ? `✅ 已修改文件: ${formatChangedFiles(resultFiles)}`
+                  : `❌ 文件修改失败: ${formatChangedFiles(resultFiles)}`)
+                : (success
+                  ? `✅ ${resultDisplayName}完成`
+                  : `❌ ${resultDisplayName}失败`);
               if (currentToolMessageId) {
                 addSystemMessage(
-                  success
-                    ? `✅ ${displayName}完成`
-                    : `❌ ${displayName}失败`,
+                  resultMessage,
                   'tool_result',
-                  chunk.data.toolName,
+                  resultToolName,
                   undefined,
                   success ? 'done' : 'failed',
                   currentToolMessageId
                 );
               } else {
                 addSystemMessage(
-                  success
-                    ? `✅ ${displayName}完成`
-                    : `❌ ${displayName}失败`,
+                  resultMessage,
                   'tool_result',
-                  chunk.data.toolName,
+                  resultToolName,
                   undefined,
                   success ? 'done' : 'failed'
                 );
               }
               currentToolMessageId = undefined;  // 重置
+              currentToolFiles = [];
               break;
             case 'state_change':
               // 更新机器人状态
@@ -1756,57 +3488,81 @@ const [showDirConfig, setShowDirConfig] = useState(false);
   };
 
   const assignZonePosition = (agent: Agent, state: AgentState) => {
-    const getRandomPos = (zone: Zone) => {
+    const hashSeed = (input: string) => {
+      let hash = 2166136261;
+      for (let i = 0; i < input.length; i++) {
+        hash ^= input.charCodeAt(i);
+        hash = Math.imul(hash, 16777619);
+      }
+      return hash >>> 0;
+    };
+
+    const seededRandom = (seed: number) => {
+      const s = Math.sin(seed) * 10000;
+      return s - Math.floor(s);
+    };
+
+    const getStablePos = (zone: Zone, seedBase: number) => {
       if (zone.rMin !== undefined && zone.rMax !== undefined) {
-        // Circular/Annular zone
-        const angle = Math.random() * Math.PI * 2;
-        const radius = zone.rMin + Math.random() * (zone.rMax - zone.rMin);
+        // Circular/annular zone with deterministic slots per agent, avoids jitter.
+        const angle = seededRandom(seedBase + 17) * Math.PI * 2;
+        const radiusT = Math.sqrt(seededRandom(seedBase + 53));
+        const radius = zone.rMin + radiusT * (zone.rMax - zone.rMin);
         return {
           x: zone.x + Math.cos(angle) * radius,
           y: zone.y + Math.sin(angle) * radius
         };
       }
-      
+
       // Square zone
+      const ux = seededRandom(seedBase + 11) - 0.5;
+      const uy = seededRandom(seedBase + 29) - 0.5;
       return {
-        x: zone.x + (Math.random() - 0.5) * (zone.w || 0),
-        y: zone.y + (Math.random() - 0.5) * (zone.h || 0)
+        x: zone.x + ux * (zone.w || 0),
+        y: zone.y + uy * (zone.h || 0)
       };
     };
 
     let targetZone = ZONES.ROUNDTABLE;
-    
+
     switch (state) {
       case 'IDLE':
       case 'THINKING':
+      case 'PLANNING':
       case 'AWAITING_APPROVAL':
         targetZone = ZONES.ROUNDTABLE;
         break;
       case 'READING':
+      case 'REVIEWING':
         targetZone = ZONES.LIBRARY;
         break;
       case 'WRITING':
         targetZone = ZONES.WORKSHOP;
         break;
       case 'EXECUTING':
+      case 'TESTING':
       case 'ERROR':
         targetZone = ZONES.PROVING_GROUNDS;
         break;
+      case 'DONE':
       case 'SUCCESS':
         targetZone = ZONES.REST_AREA;
         break;
     }
 
-    const pos = getRandomPos(targetZone);
+    const seedBase = hashSeed(`${agent.id}:${targetZone.id}`);
+    const pos = getStablePos(targetZone, seedBase);
     agent.targetX = pos.x;
     agent.targetY = pos.y;
   };
 
   // --- State Management ---
   const addAgent = async () => {
-    const colors = ['#b87333', '#3b82f6', '#10b981', '#8b5cf6', '#ef4444', '#f59e0b', '#ec4899', '#06b6d4'];
+    // 创建主 Agent（使用 'primary' 类型）
+    const agentType: AgentType = 'primary';
+    const typeConfig = AGENT_TYPE_CONFIG[agentType];
 
-    // 🤖 使用 SDK 创建机器人（如果可用）
+    // 🤖 使用 SDK 创建机器人
     let newAgent;
     try {
       newAgent = await addSDKAgent(
@@ -1818,9 +3574,10 @@ const [showDirConfig, setShowDirConfig] = useState(false);
           state: 'IDLE',
           speed: 90 + Math.random() * 60,
           facing: Math.random() > 0.5 ? 'right' : 'left',
-          message: 'Ready for duty!',
+          message: `${typeConfig.icon} ${typeConfig.name} ready!`,
+          color: typeConfig.color,
         },
-        colors
+        agentType
       );
     } catch (error) {
       console.error('SDK agent creation failed, using fallback:', error);
@@ -1836,9 +3593,12 @@ const [showDirConfig, setShowDirConfig] = useState(false);
         frame: 0,
         facing: Math.random() > 0.5 ? 'right' : 'left',
         animationVariant: 0,
-        color: colors[agentsRef.current.length % colors.length],
-        message: 'Ready for duty! (No SDK)',
-        overrideTimeout: null
+        color: typeConfig.color,
+        message: `${typeConfig.icon} ${typeConfig.name} ready! (No SDK)`,
+        overrideTimeout: null,
+        agentType,
+        isPrimaryAgent: true,
+        isTemporary: false,
       };
     }
 
@@ -1853,6 +3613,10 @@ const [showDirConfig, setShowDirConfig] = useState(false);
 
     if (!targetAgent) return;
 
+    const stateChanged = targetAgent.state !== newState;
+    const messageChanged = targetAgent.message !== msg;
+    if (!stateChanged && !messageChanged) return;
+
     // 🤖 首先通过 SDK 触发状态变化
     triggerSDKState(newState, msg, targetAgent.id);
 
@@ -1862,15 +3626,21 @@ const [showDirConfig, setShowDirConfig] = useState(false);
       targetAgent.overrideTimeout = null;
     }
 
-    targetAgent.state = newState;
-    targetAgent.message = msg;
+    if (stateChanged) {
+      targetAgent.state = newState;
+    }
+    if (messageChanged) {
+      targetAgent.message = msg;
+      targetAgent.lastMessage = msg;
+    }
     targetAgent.overrideMode = undefined;
 
-    // SUCCESS has 4 variants now, others have 3
-    const maxVariants = newState === 'SUCCESS' ? 4 : 3;
-    targetAgent.animationVariant = Math.floor(Math.random() * maxVariants);
-
-    assignZonePosition(targetAgent, newState);
+    if (stateChanged) {
+      // SUCCESS has 4 variants now, others have 3
+      const maxVariants = (newState === 'SUCCESS' || newState === 'DONE') ? 4 : 3;
+      targetAgent.animationVariant = Math.floor(Math.random() * maxVariants);
+      assignZonePosition(targetAgent, newState);
+    }
 
     if (newState === 'AWAITING_APPROVAL') {
       setApprovalAgentId(targetAgent.id);
@@ -1958,7 +3728,9 @@ const [showDirConfig, setShowDirConfig] = useState(false);
       if (isDragging) eyeColor = '#ef4444'; // Scared/struggling eyes
       else if (agent.state === 'ERROR') eyeColor = '#ef4444'; // Red
       else if (agent.state === 'THINKING' || agent.state === 'PLANNING') eyeColor = '#f59e0b'; // Yellow
-      else if (agent.state === 'SUCCESS') eyeColor = '#ec4899'; // Pink
+      else if (agent.state === 'TESTING') eyeColor = '#22d3ee'; // Cyan
+      else if (agent.state === 'REVIEWING') eyeColor = '#a78bfa'; // Violet
+      else if (agent.state === 'DONE' || agent.state === 'SUCCESS') eyeColor = '#ec4899'; // Pink
       else if (agent.state === 'READING' || agent.state === 'WRITING') eyeColor = '#3b82f6'; // Blue
 
       // Pixel Art Robot Sprites (12x14 grid)
@@ -2112,7 +3884,7 @@ const [showDirConfig, setShowDirConfig] = useState(false);
           ctx.fillStyle = '#d4d4d4';
           ctx.fillRect(orbitX + 1, orbitY - 18, 6, 1);
         }
-      } else if (agent.state === 'THINKING' && !isMoving) {
+      } else if ((agent.state === 'THINKING' || agent.state === 'PLANNING') && !isMoving) {
         if (agent.animationVariant === 0) {
           // Variant 0: Thinking bubble (Roundtable)
           ctx.fillStyle = '#f59e0b';
@@ -2160,6 +3932,63 @@ const [showDirConfig, setShowDirConfig] = useState(false);
             ctx.fillRect(14, 4, 4, 2);
             ctx.fillRect(-6, 4, 4, 2);
           }
+        }
+      } else if (agent.state === 'TESTING' && !isMoving) {
+        if (agent.animationVariant === 0) {
+          // Variant 0: Checklist clipboard
+          ctx.fillStyle = '#f8fafc';
+          ctx.fillRect(10, -22, 16, 22);
+          ctx.fillStyle = '#22d3ee';
+          ctx.fillRect(12, -18, 10, 2);
+          const blink = Math.floor(time / 180) % 2 === 0;
+          ctx.fillStyle = blink ? '#10b981' : '#94a3b8';
+          ctx.fillRect(12, -12, 3, 3);
+          ctx.fillRect(12, -6, 3, 3);
+          ctx.fillRect(12, 0, 3, 3);
+        } else if (agent.animationVariant === 1) {
+          // Variant 1: Oscilloscope waveform
+          ctx.strokeStyle = '#22d3ee';
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.moveTo(-18, -6);
+          for (let x = -18; x <= 18; x += 4) {
+            const y = Math.sin((time / 90) + x / 6) * 7;
+            ctx.lineTo(x, y - 8);
+          }
+          ctx.stroke();
+          ctx.lineWidth = 1;
+        } else {
+          // Variant 2: Scan beam
+          const scanY = -20 + ((time / 40) % 28);
+          ctx.fillStyle = 'rgba(34,211,238,0.25)';
+          ctx.fillRect(-18, scanY, 36, 4);
+          ctx.fillStyle = '#22d3ee';
+          ctx.fillRect(-18, scanY + 1, 36, 1);
+        }
+      } else if (agent.state === 'REVIEWING' && !isMoving) {
+        if (agent.animationVariant === 0) {
+          // Variant 0: Reviewing document with stamp
+          ctx.fillStyle = '#f8fafc';
+          ctx.fillRect(10, -20, 16, 20);
+          ctx.fillStyle = '#a78bfa';
+          ctx.fillRect(12, -16, 12, 2);
+          ctx.fillRect(12, -11, 9, 2);
+          ctx.fillStyle = Math.floor(time / 220) % 2 === 0 ? '#f97316' : '#fb7185';
+          ctx.fillRect(18, -4, 6, 6);
+        } else if (agent.animationVariant === 1) {
+          // Variant 1: Balance bars
+          const sway = Math.sin(time / 220) * 4;
+          ctx.fillStyle = '#c4b5fd';
+          ctx.fillRect(14, -18, 3, 20);
+          ctx.fillRect(4, -16 + sway, 10, 2);
+          ctx.fillRect(18, -16 - sway, 10, 2);
+        } else {
+          // Variant 2: Highlight sweep
+          const sweep = ((time / 50) % 22) - 11;
+          ctx.fillStyle = '#ddd6fe';
+          ctx.fillRect(10, -20, 16, 20);
+          ctx.fillStyle = 'rgba(168,85,247,0.35)';
+          ctx.fillRect(12, -15 + sweep, 12, 4);
         }
       } else if (agent.state === 'EXECUTING' && !isMoving) {
         if (agent.animationVariant === 0) {
@@ -2217,7 +4046,7 @@ const [showDirConfig, setShowDirConfig] = useState(false);
         ctx.fillStyle = '#eab308';
         ctx.fillRect(-2, -35, 4, 12);
         ctx.fillRect(-2, -20, 4, 4);
-      } else if (agent.state === 'SUCCESS' && !isMoving) {
+      } else if ((agent.state === 'DONE' || agent.state === 'SUCCESS') && !isMoving) {
         if (agent.animationVariant === 0) {
           // Variant 0: Heart (Rest Area)
           ctx.fillStyle = '#ec4899';
@@ -2266,21 +4095,167 @@ const [showDirConfig, setShowDirConfig] = useState(false);
       }
       } // End of !isDragging block
 
+      if (agent.gestureUntil && time < agent.gestureUntil) {
+        const wave = Math.sin(time / 55) * 5;
+        const isSpawnGesture = agent.gestureType === 'spawn';
+        ctx.fillStyle = isSpawnGesture ? '#facc15' : '#f8fafc';
+        ctx.fillRect(16 + wave, -20, 4, 14);
+        ctx.fillRect(12 + wave, -8, 10, 3);
+
+        ctx.strokeStyle = isSpawnGesture ? 'rgba(250, 204, 21, 0.7)' : 'rgba(248, 250, 252, 0.7)';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(26 + wave, -18, 8 + Math.abs(Math.sin(time / 120)) * 4, -Math.PI / 3, Math.PI / 2);
+        ctx.stroke();
+      }
+
       ctx.restore();
     };
 
+    const drawSubAgentLinks = (ctx: CanvasRenderingContext2D, time: number, agentMap: Map<string, Agent>) => {
+      for (const link of subAgentLinksRef.current) {
+        const parent = agentMap.get(link.parentId);
+        const child = agentMap.get(link.childId);
+        if (!parent || !child) continue;
+
+        const pulse = 0.25 + Math.abs(Math.sin((time + link.createdAt) / 360)) * 0.35;
+        const alpha = link.pulling ? 0.65 : pulse;
+
+        ctx.save();
+        ctx.strokeStyle = link.pulling
+          ? `rgba(248,250,252,${alpha})`
+          : `rgba(166, 226, 255, ${alpha})`;
+        ctx.lineWidth = link.pulling ? 2.6 : 1.7;
+        ctx.setLineDash(link.pulling ? [6, 6] : [4, 10]);
+        ctx.lineDashOffset = -time / (link.pulling ? 18 : 36);
+        ctx.beginPath();
+        ctx.moveTo(parent.x, parent.y - 8);
+        ctx.lineTo(child.x, child.y - 8);
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      for (const pulse of linkPulsesRef.current) {
+        const parent = agentMap.get(pulse.parentId);
+        const child = agentMap.get(pulse.childId);
+        if (!parent || !child) continue;
+
+        const rawProgress = (time - pulse.createdAt) / pulse.duration;
+        if (rawProgress <= 0) continue;
+        const progress = Math.min(rawProgress, 1);
+        const easedProgress = 0.5 - Math.cos(Math.PI * progress) / 2;
+        const from = pulse.direction === 'parent_to_child'
+          ? { x: parent.x, y: parent.y - 8 }
+          : { x: child.x, y: child.y - 8 };
+        const to = pulse.direction === 'parent_to_child'
+          ? { x: child.x, y: child.y - 8 }
+          : { x: parent.x, y: parent.y - 8 };
+
+        const x = from.x + (to.x - from.x) * easedProgress;
+        const y = from.y + (to.y - from.y) * easedProgress;
+        const tailProgress = Math.max(easedProgress - 0.14, 0);
+        const tailX = from.x + (to.x - from.x) * tailProgress;
+        const tailY = from.y + (to.y - from.y) * tailProgress;
+        const baseColor = pulse.color || 'rgba(186,230,253,0.95)';
+        const alpha = 1 - progress * 0.75;
+        const color = baseColor.includes('rgba(')
+          ? baseColor.replace(/rgba\(([^,]+),([^,]+),([^,]+),([^)]+)\)/, `rgba($1,$2,$3,${alpha.toFixed(3)})`)
+          : baseColor;
+
+        ctx.save();
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1.6;
+        ctx.beginPath();
+        ctx.moveTo(tailX, tailY);
+        ctx.lineTo(x, y);
+        ctx.stroke();
+
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.arc(x, y, 2.8, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+      }
+    };
+
+    const drawPortalEffects = (ctx: CanvasRenderingContext2D, time: number) => {
+      for (const portal of portalEffectsRef.current) {
+        const t = Math.min((time - portal.createdAt) / portal.duration, 1);
+        const pulse = 1 + Math.sin(time / 70) * 0.08;
+
+        if (portal.type === 'black') {
+          const radius = (6 + Math.sin(t * Math.PI) * 22) * pulse;
+          ctx.save();
+          ctx.translate(portal.x, portal.y);
+          ctx.fillStyle = `rgba(5, 8, 20, ${0.9 - t * 0.55})`;
+          ctx.beginPath();
+          ctx.arc(0, 0, radius, 0, Math.PI * 2);
+          ctx.fill();
+
+          ctx.strokeStyle = `rgba(56, 189, 248, ${0.75 - t * 0.4})`;
+          ctx.lineWidth = 3;
+          ctx.beginPath();
+          ctx.arc(0, 0, radius + 3, 0, Math.PI * 2);
+          ctx.stroke();
+          ctx.restore();
+        } else {
+          const radius = (8 + Math.sin(t * Math.PI) * 28) * pulse;
+          ctx.save();
+          ctx.translate(portal.x, portal.y);
+          ctx.fillStyle = `rgba(255,255,255,${0.85 - t * 0.45})`;
+          ctx.beginPath();
+          ctx.arc(0, 0, radius, 0, Math.PI * 2);
+          ctx.fill();
+
+          ctx.strokeStyle = `rgba(191, 219, 254, ${0.9 - t * 0.45})`;
+          ctx.lineWidth = 3;
+          ctx.beginPath();
+          ctx.arc(0, 0, radius + 4, 0, Math.PI * 2);
+          ctx.stroke();
+          ctx.restore();
+        }
+      }
+    };
+
     const update = (dt: number) => {
+      const now = performance.now();
       let emergencyActive = emergencyEndTimeRef.current > 0;
       let allArrivedEmergency = true;
+      const agentMap = new Map<string, Agent>(
+        agentsRef.current.map((agent): [string, Agent] => [agent.id, agent])
+      );
+      const absorbingAgentIds = new Set(absorbEffectsRef.current.map(effect => effect.agentId));
 
       agentsRef.current.forEach(agent => {
+        if (agent.gestureUntil && now > agent.gestureUntil) {
+          agent.gestureUntil = undefined;
+          agent.gestureType = undefined;
+        }
+        if (agent.freezeUntil && now > agent.freezeUntil) {
+          agent.freezeUntil = undefined;
+        }
+
+        if (absorbingAgentIds.has(agent.id)) {
+          return;
+        }
+
+        if (agent.freezeUntil && now < agent.freezeUntil) {
+          if (agent.overrideMode === 'moving_to_emergency') {
+            allArrivedEmergency = false;
+          }
+          return;
+        }
+
         // Move towards target
         const dx = agent.targetX - agent.x;
         const dy = agent.targetY - agent.y;
         const dist = Math.sqrt(dx * dx + dy * dy);
         
         if (dist > 2) {
-          const moveStep = agent.speed * dt;
+          // Ease out near target to avoid abrupt stop / jitter.
+          const slowRadius = 56;
+          const speedScale = dist < slowRadius ? Math.max(0.35, dist / slowRadius) : 1;
+          const moveStep = agent.speed * speedScale * dt;
           if (moveStep >= dist) {
             agent.x = agent.targetX;
             agent.y = agent.targetY;
@@ -2308,14 +4283,70 @@ const [showDirConfig, setShowDirConfig] = useState(false);
         }
       });
 
+      const absorbedIds: string[] = [];
+      absorbEffectsRef.current = absorbEffectsRef.current.filter(effect => {
+        const agent = agentMap.get(effect.agentId);
+        const parent = agentMap.get(effect.parentId);
+        if (!agent || !parent) {
+          return false;
+        }
+
+        const progress = Math.min((now - effect.startAt) / effect.duration, 1);
+        const targetX = parent.x;
+        const targetY = parent.y - 12;
+        const swirl = Math.sin(progress * Math.PI * 6) * (1 - progress) * 10;
+        const lift = Math.cos(progress * Math.PI * 6) * (1 - progress) * 4;
+
+        agent.x = effect.startX + (targetX - effect.startX) * progress + swirl;
+        agent.y = effect.startY + (targetY - effect.startY) * progress - lift;
+        agent.targetX = agent.x;
+        agent.targetY = agent.y;
+        agent.facing = targetX > agent.x ? 'right' : 'left';
+
+        if (progress >= 1) {
+          absorbedIds.push(effect.agentId);
+          return false;
+        }
+        return true;
+      });
+
+      if (absorbedIds.length > 0) {
+        const absorbedSet = new Set(absorbedIds);
+        agentsRef.current = agentsRef.current.filter(agent => !absorbedSet.has(agent.id));
+        subAgentLinksRef.current = subAgentLinksRef.current.filter(link => !absorbedSet.has(link.childId));
+
+        setChatSessions(prev => {
+          const next = new Map(prev);
+          absorbedIds.forEach(id => next.delete(id));
+          return next;
+        });
+
+        setAgentsData([...agentsRef.current]);
+      }
+
+      portalEffectsRef.current = portalEffectsRef.current.filter(
+        portal => (now - portal.createdAt) <= portal.duration
+      );
+      const aliveAgentIds = new Set(agentsRef.current.map(agent => agent.id));
+      subAgentLinksRef.current = subAgentLinksRef.current.filter(link => {
+        return aliveAgentIds.has(link.parentId) && aliveAgentIds.has(link.childId);
+      });
+      linkPulsesRef.current = linkPulsesRef.current.filter(pulse => {
+        const alive = (now - pulse.createdAt) <= pulse.duration;
+        if (!alive) return false;
+        return aliveAgentIds.has(pulse.parentId) && aliveAgentIds.has(pulse.childId);
+      });
+
       if (emergencyActive && allArrivedEmergency) {
         emergencyEndTimeRef.current = 0; // Stop flashing
-        setCurrentView('ROUNDTABLE_CHAT');
+        if (brainstormSessionRef.current?.phase === 'SUMMONING') {
+          setCurrentView('ROUNDTABLE_CHAT');
+        }
       }
     };
 
     const loop = (time: number) => {
-      const dt = (time - lastTime) / 1000;
+      const dt = Math.min((time - lastTime) / 1000, 0.05);
       lastTime = time;
 
       update(dt);
@@ -2331,6 +4362,11 @@ const [showDirConfig, setShowDirConfig] = useState(false);
       
       // Render
       drawEnvironment(ctx, time);
+      const frameAgentMap = new Map<string, Agent>(
+        agentsRef.current.map((agent): [string, Agent] => [agent.id, agent])
+      );
+      drawSubAgentLinks(ctx, time, frameAgentMap);
+      drawPortalEffects(ctx, time);
 
       // Draw Emergency Button
       const btn = INTERACTABLES.EMERGENCY_BUTTON;
@@ -2481,14 +4517,28 @@ const [showDirConfig, setShowDirConfig] = useState(false);
                 agentsData={agentsData}
                 onAssignTask={assignTaskToAgent}
                 onExecuteTask={executeTask}
+                selectedAgentForSingleMode={selectedAgentForSingleMode}
+                setSelectedAgentForSingleMode={setSelectedAgentForSingleMode}
+                executionMode={executionMode}
+                setExecutionMode={setExecutionMode}
+                onError={(msg: string) => {
+                  setErrorMessage(msg);
+                  setShowErrorDialog(true);
+                }}
               />
             )}
 
-            {currentView === 'ROUNDTABLE_CHAT' && (
-              <RoundtableChat onClose={() => {
-                setCurrentView('MAIN');
-                triggerState('IDLE', 'Brainstorming session ended.');
-              }} />
+            {currentView === 'ROUNDTABLE_CHAT' && brainstormSession && (
+              <RoundtableChat
+                session={brainstormSession}
+                onClose={closeRoundtable}
+                onSendMessage={runBrainstormClarification}
+                onGenerateOptions={generateBrainstormOptions}
+                onGenerateSpec={generateBrainstormSpec}
+                onGeneratePlan={generateBrainstormPlan}
+                onApproveAndExecute={approveBrainstormAndExecute}
+                onFinishWithoutExecution={finishBrainstormWithoutExecution}
+              />
             )}
 
             {currentView === 'CLI_CHAT' && (
@@ -2568,8 +4618,8 @@ const [showDirConfig, setShowDirConfig] = useState(false);
                   left: agent.x, 
                   top: agent.y - 60,
                   transform: 'translate(-50%, -100%)',
-                  opacity: agent.state === 'IDLE' ? 0 : 1,
-                  pointerEvents: agent.state === 'IDLE' ? 'none' : 'auto'
+                  opacity: agent.state === 'IDLE' && !agent.isTemporary ? 0 : 1,
+                  pointerEvents: agent.state === 'IDLE' && !agent.isTemporary ? 'none' : 'auto'
                 }}
               >
                 <div 
@@ -2612,6 +4662,10 @@ const [showDirConfig, setShowDirConfig] = useState(false);
                     <div>
                       <h3 className="text-[#5d4037] text-xs uppercase tracking-tighter">Agent Transmission</h3>
                       <p className="text-[8px] text-[#8b5a2b] mt-1">Status: {agent.state}</p>
+                      <p className="text-[8px] text-[#8b5a2b] mt-1">Type: {agent.agentType || 'primary'}</p>
+                      {agent.parentAgentId && (
+                        <p className="text-[8px] text-[#8b5a2b] mt-1">Parent: {agent.parentAgentId}</p>
+                      )}
                     </div>
                   </div>
 
@@ -2655,7 +4709,9 @@ const [showDirConfig, setShowDirConfig] = useState(false);
 
             {/* Approval Dialog Overlay - 复用用于权限审批和用户提问 */}
             {approvalAgentId && (() => {
-              const agent = agentsData.find(a => a.id === approvalAgentId);
+              const agent = agentsData.find(a => a.id === approvalAgentId)
+                || agentsData.find(a => !a.isTemporary)
+                || agentsData[0];
               if (!agent) return null;
 
               return (
@@ -2859,11 +4915,11 @@ const [showDirConfig, setShowDirConfig] = useState(false);
             {/* Bottom UI Icons */}
             <div className="absolute bottom-4 left-1/2 -translate-x-1/2 flex gap-4 z-40">
               <button
-                onClick={() => setShowDirConfig(true)}
+                onClick={openSettingsConfig}
                 className="bg-[#2d1b15] border-4 border-[#5d4037] p-3 shadow-[4px_4px_0px_0px_rgba(0,0,0,0.5)] hover:bg-[#3e2723] hover:translate-y-[2px] hover:shadow-[2px_2px_0px_0px_rgba(0,0,0,0.5)] active:translate-y-[4px] active:shadow-none transition-all group"
-                title="Configure Working Directory"
+                title="Configure API Settings"
               >
-                <Folder className="text-[#a1887f] group-hover:text-[#d7ccc8] transition-colors" size={28} />
+                <Settings className="text-[#a1887f] group-hover:text-[#d7ccc8] transition-colors" size={24} />
               </button>
               <button
                 onClick={() => {
@@ -2878,10 +4934,10 @@ const [showDirConfig, setShowDirConfig] = useState(false);
               >
                 <Terminal className="text-[#a1887f] group-hover:text-[#d7ccc8] transition-colors" size={24} />
               </button>
-              <button 
-                onClick={addAgent}
+              <button
+                onClick={() => addAgent()}
                 className="bg-[#2d1b15] border-4 border-[#5d4037] p-3 shadow-[4px_4px_0px_0px_rgba(0,0,0,0.5)] hover:bg-[#3e2723] hover:translate-y-[2px] hover:shadow-[2px_2px_0px_0px_rgba(0,0,0,0.5)] active:translate-y-[4px] active:shadow-none transition-all group"
-                title="Add New Agent"
+                title="Add New Primary Agent"
               >
                 <Bot className="text-[#a1887f] group-hover:text-[#d7ccc8] transition-colors" size={24} />
               </button>
@@ -2898,71 +4954,181 @@ const [showDirConfig, setShowDirConfig] = useState(false);
         </div>
       </div>
 
-      {/* Directory Config Modal - Outside canvas container */}
-      {showDirConfig && (
-        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-[100] p-8" onClick={() => setShowDirConfig(false)}>
+      {/* API & Runtime Settings Modal */}
+      {showSettingsConfig && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-[110] p-8" onClick={() => setShowSettingsConfig(false)}>
           <div
-            className="bg-[#f4e4bc] border-8 border-[#8b5a2b] p-8 max-w-md w-full shadow-2xl relative animate-in zoom-in duration-200"
+            className="bg-[#f4e4bc] border-8 border-[#8b5a2b] p-8 max-w-2xl w-full shadow-2xl relative animate-in zoom-in duration-200"
             style={{ fontFamily: '"Press Start 2P", cursive' }}
             onClick={(e) => e.stopPropagation()}
           >
             <button
-              onClick={() => setShowDirConfig(false)}
+              onClick={() => setShowSettingsConfig(false)}
               className="absolute -top-6 -right-6 bg-red-900 text-white p-2 border-4 border-red-950 hover:bg-red-700 transition-colors cursor-pointer"
             >
               <X size={20} />
             </button>
 
             <h3 className="text-[#5d4037] text-xs uppercase tracking-tighter mb-6 flex items-center gap-3">
-              <Folder size={28} />
-              Working Directory
+              <Settings size={24} />
+              Runtime Settings
             </h3>
 
-            <div className="mb-4">
-              <label className="text-[8px] text-[#8b5a2b] mb-2 block uppercase tracking-tighter">Current Path:</label>
-              <div className="flex gap-2">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
+              <div>
+                <label className="text-[8px] text-[#8b5a2b] mb-2 block uppercase tracking-tighter">API Key:</label>
+                <input
+                  type="password"
+                  value={settingsDraft.apiKey}
+                  onChange={(e) => setSettingsDraft(prev => ({ ...prev, apiKey: e.target.value }))}
+                  className="w-full bg-black/5 border-4 border-[#8b5a2b] px-4 py-3 text-[#4e342e] text-[10px] focus:outline-none focus:border-[#fef08a]"
+                  style={{ fontFamily: '"Press Start 2P", cursive' }}
+                  placeholder="Enter API key..."
+                />
+              </div>
+
+              <div>
+                <label className="text-[8px] text-[#8b5a2b] mb-2 block uppercase tracking-tighter">Model:</label>
                 <input
                   type="text"
-                  value={workingDirectory}
-                  onChange={(e) => setWorkingDirectory(e.target.value)}
-                  className="flex-1 bg-black/5 border-4 border-[#8b5a2b] px-4 py-3 text-[#4e342e] text-[10px] focus:outline-none focus:border-[#fef08a]"
+                  value={settingsDraft.model}
+                  onChange={(e) => setSettingsDraft(prev => ({ ...prev, model: e.target.value }))}
+                  className="w-full bg-black/5 border-4 border-[#8b5a2b] px-4 py-3 text-[#4e342e] text-[10px] focus:outline-none focus:border-[#fef08a]"
                   style={{ fontFamily: '"Press Start 2P", cursive' }}
-                  placeholder="Enter project path..."
+                  placeholder="e.g. glm-4.7"
                 />
-                <button
-                  onClick={browseDirectory}
-                  className="bg-[#5d4037] hover:bg-[#3e2723] text-[#f4e4bc] px-4 py-2 border-4 border-[#2d1b15] text-[8px] font-bold cursor-pointer transition-colors flex items-center gap-2"
-                  title="Browse for folder"
-                >
-                  <Folder size={20} />
-                  Browse
-                </button>
+              </div>
+
+              <div className="md:col-span-2">
+                <label className="text-[8px] text-[#8b5a2b] mb-2 block uppercase tracking-tighter">Base URL:</label>
+                <input
+                  type="text"
+                  value={settingsDraft.baseURL}
+                  onChange={(e) => setSettingsDraft(prev => ({ ...prev, baseURL: e.target.value }))}
+                  className="w-full bg-black/5 border-4 border-[#8b5a2b] px-4 py-3 text-[#4e342e] text-[10px] focus:outline-none focus:border-[#fef08a]"
+                  style={{ fontFamily: '"Press Start 2P", cursive' }}
+                  placeholder="https://..."
+                />
+              </div>
+
+              <div>
+                <label className="text-[8px] text-[#8b5a2b] mb-2 block uppercase tracking-tighter">Timeout (ms):</label>
+                <input
+                  type="number"
+                  value={settingsDraft.timeout}
+                  onChange={(e) => setSettingsDraft(prev => ({ ...prev, timeout: e.target.value }))}
+                  className="w-full bg-black/5 border-4 border-[#8b5a2b] px-4 py-3 text-[#4e342e] text-[10px] focus:outline-none focus:border-[#fef08a]"
+                  style={{ fontFamily: '"Press Start 2P", cursive' }}
+                  min={1000}
+                  max={600000}
+                />
+              </div>
+
+              <div>
+                <label className="text-[8px] text-[#8b5a2b] mb-2 block uppercase tracking-tighter">Max Tokens:</label>
+                <input
+                  type="number"
+                  value={settingsDraft.maxTokens}
+                  onChange={(e) => setSettingsDraft(prev => ({ ...prev, maxTokens: e.target.value }))}
+                  className="w-full bg-black/5 border-4 border-[#8b5a2b] px-4 py-3 text-[#4e342e] text-[10px] focus:outline-none focus:border-[#fef08a]"
+                  style={{ fontFamily: '"Press Start 2P", cursive' }}
+                  min={256}
+                  max={128000}
+                />
+              </div>
+
+              <div>
+                <label className="text-[8px] text-[#8b5a2b] mb-2 block uppercase tracking-tighter">Max Steps:</label>
+                <input
+                  type="number"
+                  value={settingsDraft.maxSteps}
+                  onChange={(e) => setSettingsDraft(prev => ({ ...prev, maxSteps: e.target.value }))}
+                  className="w-full bg-black/5 border-4 border-[#8b5a2b] px-4 py-3 text-[#4e342e] text-[10px] focus:outline-none focus:border-[#fef08a]"
+                  style={{ fontFamily: '"Press Start 2P", cursive' }}
+                  min={1}
+                  max={100}
+                />
+              </div>
+
+              <div className="md:col-span-2">
+                <label className="text-[8px] text-[#8b5a2b] mb-2 block uppercase tracking-tighter">Working Directory:</label>
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    value={settingsDraft.workingDirectory}
+                    onChange={(e) => setSettingsDraft(prev => ({ ...prev, workingDirectory: e.target.value }))}
+                    className="flex-1 bg-black/5 border-4 border-[#8b5a2b] px-4 py-3 text-[#4e342e] text-[10px] focus:outline-none focus:border-[#fef08a]"
+                    style={{ fontFamily: '"Press Start 2P", cursive' }}
+                    placeholder="Enter project path..."
+                  />
+                  <button
+                    onClick={() => browseDirectory((dir) => {
+                      setSettingsDraft(prev => ({ ...prev, workingDirectory: dir }));
+                    })}
+                    className="bg-[#5d4037] hover:bg-[#3e2723] text-[#f4e4bc] px-4 py-2 border-4 border-[#2d1b15] text-[8px] font-bold cursor-pointer transition-colors flex items-center gap-2"
+                    title="Browse for folder"
+                  >
+                    <Folder size={20} />
+                    Browse
+                  </button>
+                </div>
               </div>
             </div>
 
             <div className="mb-6 bg-black/10 p-3 border-2 border-[#8b5a2b]/30">
-              <div className="text-[8px] text-[#5d4037] mb-1">📍 Current directory:</div>
-              <div className="text-[8px] text-[#8b5a2b] font-mono break-all">{workingDirectory}</div>
+              <div className="text-[8px] text-[#5d4037] mb-1">提示: 保存后新请求会立即使用新配置</div>
+              <div className="text-[8px] text-[#8b5a2b] font-mono break-all">BaseURL: {settingsDraft.baseURL}</div>
+              <div className="text-[8px] text-[#8b5a2b] font-mono">Model: {settingsDraft.model}</div>
+              <div className="text-[8px] text-[#8b5a2b] font-mono">MaxSteps: {settingsDraft.maxSteps}</div>
             </div>
+
+            {connectivityTestResult && (
+              <div className={`mb-6 p-3 border-2 ${
+                connectivityTestResult.success
+                  ? 'bg-emerald-100/70 border-emerald-700'
+                  : 'bg-red-100/70 border-red-700'
+              }`}>
+                <div className={`text-[8px] mb-1 ${
+                  connectivityTestResult.success ? 'text-emerald-900' : 'text-red-900'
+                }`}>
+                  {connectivityTestResult.success ? '✅ 连通性测试成功' : '❌ 连通性测试失败'}
+                </div>
+                <div className="text-[8px] text-[#4e342e] break-words">{connectivityTestResult.message}</div>
+                <div className="text-[8px] text-[#5d4037] mt-1">Latency: {connectivityTestResult.latencyMs}ms</div>
+                {connectivityTestResult.errorCode && (
+                  <div className="text-[8px] text-[#5d4037]">Error Code: {connectivityTestResult.errorCode}</div>
+                )}
+                {connectivityTestResult.responsePreview && (
+                  <div className="text-[8px] text-[#5d4037] break-words">Response: {connectivityTestResult.responsePreview}</div>
+                )}
+              </div>
+            )}
 
             <div className="flex justify-between items-center">
               <button
-                onClick={() => setShowDirConfig(false)}
+                onClick={() => setShowSettingsConfig(false)}
                 className="px-4 py-2 bg-[#d7ccc8] hover:bg-[#bcaaa4] text-[#4e342e] text-[10px] font-bold cursor-pointer transition-colors border-2 border-[#8d6e63]"
               >
                 CANCEL
               </button>
-              <button
-                onClick={() => {
-                  saveWorkingDirectory(workingDirectory);
-                  setShowDirConfig(false);
-                  // 显示保存成功提示
-                  console.log('[App] Working directory saved:', workingDirectory);
-                }}
-                className="bg-[#8b5a2b] hover:bg-[#5d4037] text-[#f4e4bc] px-6 py-2 border-4 border-[#2d1b15] text-[10px] font-bold cursor-pointer transition-colors shadow-[0_4px_0_0_rgba(0,0,0,0.3)] hover:shadow-[0_2px_0_0_rgba(0,0,0,0.3)] hover:translate-y-[2px] active:shadow-none active:translate-y-[4px]"
-              >
-                SAVE
-              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => {
+                    void runSettingsConnectivityTest();
+                  }}
+                  disabled={isTestingConnectivity}
+                  className="bg-[#1f2937] hover:bg-[#111827] disabled:bg-zinc-600 disabled:cursor-not-allowed text-[#f4e4bc] px-4 py-2 border-4 border-[#0f172a] text-[10px] font-bold cursor-pointer transition-colors"
+                >
+                  {isTestingConnectivity ? 'TESTING...' : 'TEST CONNECT'}
+                </button>
+                <button
+                  onClick={saveSettingsConfig}
+                  disabled={isTestingConnectivity}
+                  className="bg-[#8b5a2b] hover:bg-[#5d4037] disabled:bg-zinc-600 disabled:cursor-not-allowed text-[#f4e4bc] px-6 py-2 border-4 border-[#2d1b15] text-[10px] font-bold cursor-pointer transition-colors shadow-[0_4px_0_0_rgba(0,0,0,0.3)] hover:shadow-[0_2px_0_0_rgba(0,0,0,0.3)] hover:translate-y-[2px] active:shadow-none active:translate-y-[4px]"
+                >
+                  SAVE
+                </button>
+              </div>
             </div>
           </div>
         </div>
@@ -3065,6 +5231,53 @@ const [showDirConfig, setShowDirConfig] = useState(false);
                 <div className="inline-block animate-spin rounded-full h-8 w-8 border-4 border-[#8b5a2b] border-t-transparent"></div>
               </div>
             )}
+          </div>
+        </div>
+      )}
+
+      {/* Error Dialog */}
+      {showErrorDialog && (
+        <div
+          className="absolute inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4"
+          onClick={() => setShowErrorDialog(false)}
+        >
+          <div
+            className="relative w-full max-w-[400px] bg-[#4e342e] shadow-2xl border-4 border-red-900 rounded-lg p-6"
+            style={{ imageRendering: 'pixelated', fontFamily: '"Press Start 2P", cursive' }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center gap-3 mb-4">
+              <AlertTriangle className="text-red-400 w-8 h-8" />
+              <h2 className="text-sm font-bold text-red-400 tracking-wider">无法创建协作任务</h2>
+            </div>
+
+            <div className="bg-black/30 p-3 border-2 border-red-900 rounded mb-4">
+              <pre className="text-[10px] text-zinc-300 whitespace-pre-wrap font-sans">
+                {errorMessage}
+              </pre>
+            </div>
+
+            <div className="flex flex-col gap-2">
+              <button
+                onClick={() => {
+                  setShowErrorDialog(false);
+                  setErrorMessage(null);
+                }}
+                className="w-full bg-emerald-700 hover:bg-emerald-600 text-white px-4 py-2 border-2 border-emerald-900 text-[10px] font-bold cursor-pointer transition-colors"
+              >
+                添加更多机器人
+              </button>
+            </div>
+
+            <button
+              onClick={() => {
+                setShowErrorDialog(false);
+                setErrorMessage(null);
+              }}
+              className="absolute top-3 right-3 text-zinc-400 hover:text-white font-bold"
+            >
+              <X className="w-5 h-5" />
+            </button>
           </div>
         </div>
       )}

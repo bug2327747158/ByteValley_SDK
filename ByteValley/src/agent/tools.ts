@@ -28,7 +28,7 @@ export const DEFAULT_TOOLS: Tool[] = [
   },
   {
     name: 'write_file',
-    description: '写入文件内容（覆盖或创建新文件）',
+    description: '创建新文件并写入内容（仅限新文件，不允许覆盖现有文件）',
     inputSchema: {
       type: 'object',
       properties: {
@@ -52,6 +52,17 @@ export const DEFAULT_TOOLS: Tool[] = [
     },
   },
   {
+    name: 'apply_patch',
+    description: '应用统一 diff 补丁到文件（推荐用于修改现有文件）',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        patch: { type: 'string', description: '统一 diff 格式补丁内容' },
+      },
+      required: ['patch'],
+    },
+  },
+  {
     name: 'list_files',
     description: '列出目录中的文件和文件夹',
     inputSchema: {
@@ -69,6 +80,7 @@ export const DEFAULT_TOOLS: Tool[] = [
       type: 'object',
       properties: {
         command: { type: 'string', description: '要执行的命令' },
+        timeoutMs: { type: 'number', description: '命令超时时间（毫秒，可选，默认 60000）' },
       },
       required: ['command'],
     },
@@ -221,7 +233,12 @@ async function executeToolElectron(
 ): Promise<ToolResult> {
   try {
     // 默认工作目录
-    const workingDir = cwd || '/mnt/d/work_data/claude_workspace/ByteValley/claude-sdk-project';
+    const defaultWorkingDir = (
+      typeof process !== 'undefined' && process.platform === 'win32'
+        ? 'D:\\work_data\\claude_workspace\\ByteValley'
+        : '/mnt/d/work_data/claude_workspace/ByteValley'
+    );
+    const workingDir = cwd || defaultWorkingDir;
 
     console.log('[executeToolElectron] Executing in Electron:', { name, input, workingDir });
 
@@ -229,7 +246,7 @@ async function executeToolElectron(
     // @ts-ignore - Electron 环境中有 require
     const fs = require('fs');
     // @ts-ignore - Electron 环境中有 require
-    const { execSync } = require('child_process');
+    const { exec, execSync, execFile } = require('child_process');
     // @ts-ignore - Electron 环境中有 require
     const { resolve: pathResolve } = require('path');
 
@@ -249,6 +266,12 @@ async function executeToolElectron(
 
       case 'write_file': {
         const fullPath = pathResolve(workingDir, input.path);
+        if (fs.existsSync(fullPath)) {
+          return {
+            success: false,
+            error: `文件已存在，禁止全量覆盖: ${input.path}。请使用 apply_patch 或 edit_file。`,
+          };
+        }
         fs.writeFileSync(fullPath, input.content, 'utf-8');
         return { success: true, content: `文件已写入: ${input.path}` };
       }
@@ -267,6 +290,37 @@ async function executeToolElectron(
         return { success: true, content: `文件已编辑: ${input.path}` };
       }
 
+      case 'apply_patch': {
+        const patch = String(input.patch || '');
+        if (!patch.trim()) {
+          return { success: false, error: '补丁内容为空' };
+        }
+
+        // 优先使用 git apply，失败后尝试 patch 命令（如果系统可用）
+        try {
+          execSync('git apply --whitespace=nowarn -', {
+            cwd: workingDir,
+            input: patch,
+            encoding: 'utf-8',
+          });
+          return { success: true, content: '补丁已应用（git apply）' };
+        } catch (gitError: any) {
+          try {
+            execSync('patch -p0 --forward --silent', {
+              cwd: workingDir,
+              input: patch,
+              encoding: 'utf-8',
+            });
+            return { success: true, content: '补丁已应用（patch）' };
+          } catch (patchError: any) {
+            return {
+              success: false,
+              error: `apply_patch 失败: ${gitError.message || patchError.message}`,
+            };
+          }
+        }
+      }
+
       case 'list_files': {
         const targetPath = pathResolve(workingDir, input.path || '.');
         if (!fs.existsSync(targetPath)) {
@@ -280,12 +334,106 @@ async function executeToolElectron(
       }
 
       case 'run_command': {
-        const result = execSync(input.command, {
-          cwd: workingDir,
-          encoding: 'utf-8',
-          maxBuffer: 10 * 1024 * 1024,
-        });
-        return { success: true, content: result.trim() };
+        const isWindows = typeof process !== 'undefined' && process.platform === 'win32';
+        const timeoutMs = Math.min(
+          Math.max(Number(input.timeoutMs) || 60000, 1000),
+          300000
+        );
+        const maxBuffer = 10 * 1024 * 1024;
+
+        const runExecFile = (
+          file: string,
+          args: string[]
+        ): Promise<{ stdout: string; stderr: string }> => {
+          return new Promise((resolve, reject) => {
+            execFile(
+              file,
+              args,
+              {
+                cwd: workingDir,
+                encoding: 'utf-8',
+                maxBuffer,
+                timeout: timeoutMs,
+                windowsHide: true,
+              },
+              (error: any, stdout: string, stderr: string) => {
+                if (error) {
+                  error.stdout = stdout;
+                  error.stderr = stderr;
+                  reject(error);
+                  return;
+                }
+                resolve({ stdout, stderr });
+              }
+            );
+          });
+        };
+
+        const runExec = (
+          command: string
+        ): Promise<{ stdout: string; stderr: string }> => {
+          return new Promise((resolve, reject) => {
+            exec(
+              command,
+              {
+                cwd: workingDir,
+                encoding: 'utf-8',
+                maxBuffer,
+                timeout: timeoutMs,
+              },
+              (error: any, stdout: string, stderr: string) => {
+                if (error) {
+                  error.stdout = stdout;
+                  error.stderr = stderr;
+                  reject(error);
+                  return;
+                }
+                resolve({ stdout, stderr });
+              }
+            );
+          });
+        };
+
+        try {
+          let stdout = '';
+          let stderr = '';
+
+          if (isWindows) {
+            // 在 Windows 上统一使用 PowerShell，兼容 `cat`/`ls` 等常见别名
+            // 并强制 UTF-8 输出，避免中文乱码。
+            const result = await runExecFile(
+              'powershell',
+              [
+                '-NoProfile',
+                '-ExecutionPolicy',
+                'Bypass',
+                '-Command',
+                `[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); ${input.command}`,
+              ]
+            );
+            stdout = result.stdout || '';
+            stderr = result.stderr || '';
+          } else {
+            const result = await runExec(input.command);
+            stdout = result.stdout || '';
+            stderr = result.stderr || '';
+          }
+
+          const merged = `${stdout}${stderr ? `\n${stderr}` : ''}`.trim();
+          return { success: true, content: merged || '(command completed with no output)' };
+        } catch (error: any) {
+          const stdout = error?.stdout || '';
+          const stderr = error?.stderr || '';
+          const timedOut = error?.killed || error?.signal === 'SIGTERM' || error?.code === 'ETIMEDOUT';
+          const reason = timedOut
+            ? `Command timed out after ${timeoutMs}ms`
+            : (error?.message || 'Command execution failed');
+          const details = `${stdout}${stderr ? `\n${stderr}` : ''}`.trim();
+          return {
+            success: false,
+            error: details ? `${reason}\n${details}` : reason,
+          };
+        }
       }
 
       case 'search_files': {
@@ -475,13 +623,19 @@ async function executeToolBrowser(
       case 'write_file':
         return {
           success: true,
-          content: `文件已写入（模拟）: ${input.path}\n内容长度: ${input.content?.length || 0} 字符`
+          content: `新文件已创建（模拟）: ${input.path}\n内容长度: ${input.content?.length || 0} 字符`
         };
 
       case 'edit_file':
         return {
           success: true,
           content: `文件已编辑（模拟）: ${input.path}`
+        };
+
+      case 'apply_patch':
+        return {
+          success: true,
+          content: '补丁已应用（模拟）'
         };
 
       case 'list_files':
